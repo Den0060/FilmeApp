@@ -157,7 +157,7 @@ def _parse_float(wert: str) -> float | None:
 #  sie noch nicht existiert – kein manuelles Setup nötig.
 # ──────────────────────────────────────────────────────────────
 
-DB_FILE = "../FilmVaultVersion1-0/filme.db"
+DB_FILE = "filme.db"
 
 def db_init():
     # Verbindung aufmachen, Tabelle anlegen falls noch nicht da,
