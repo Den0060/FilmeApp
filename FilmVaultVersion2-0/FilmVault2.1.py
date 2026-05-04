@@ -8,6 +8,7 @@ import threading
 import requests
 from dotenv import load_dotenv
 import os
+from datetime import datetime
 
 # ──────────────────────────────────────────────────────────────
 #  IMDb via OMDb
@@ -119,6 +120,10 @@ def imdb_details(movie_id: str) -> dict | None:
             except (ValueError, TypeError):
                 pass
 
+        poster_url = film.get("Poster")
+        if poster_url == "N/A":
+            poster_url = None
+
         return {
             "titel":          film.get("Title", ""),
             "jahr":           jahr,
@@ -126,6 +131,7 @@ def imdb_details(movie_id: str) -> dict | None:
             "laufzeit":       laufzeit,
             "imdb_bewertung": imdb_bewertung,   # float, z.B. 9.0
             "imdb_id":        film.get("imdbID") or movie_id,
+            "poster_url":     poster_url,
         }
     except Exception:
         return None
@@ -176,7 +182,8 @@ def db_init():
             gesehen        INTEGER DEFAULT 0,
             laufzeit       INTEGER,    -- in Minuten
             imdb_bewertung REAL,       -- z.B. 8.7
-            imdb_id        TEXT        -- z.B. tt0111161
+            imdb_id        TEXT,       -- z.B. tt0111161
+            poster_url     TEXT
         )
     """)
     # Alte DBs nachrüsten ohne Datenverlust – schlägt einfach fehl wenn Spalte schon da ist
@@ -185,6 +192,8 @@ def db_init():
         ("laufzeit",       "INTEGER"),
         ("imdb_bewertung", "REAL"),
         ("imdb_id",        "TEXT"),
+        ("poster_url",     "TEXT"),
+        ("gesehen_am", "TEXT")
     ]:
         try:
             cur.execute(f"ALTER TABLE filme ADD COLUMN {spalte} {typ}")
@@ -194,12 +203,19 @@ def db_init():
     con.close()
 
 def _alle_felder():
-    return "id, titel, jahr, bewertung, genre, gesehen, laufzeit, imdb_bewertung, imdb_id"
+    return "id, titel, jahr, bewertung, genre, gesehen, laufzeit, imdb_bewertung, imdb_id, poster_url, gesehen_am"
 
 def db_alle():
+    # Standardsortierung: zuletzt gesehen oben, danach titel
     con = sqlite3.connect(DB_FILE)
     cur = con.cursor()
-    cur.execute(f"SELECT {_alle_felder()} FROM filme ORDER BY titel")
+    cur.execute(f"""
+        SELECT {_alle_felder()}
+        FROM filme
+        ORDER BY
+            gesehen DESC,
+            gesehen_am DESC
+    """) # Standard-Sortierung
     rows = cur.fetchall()
     con.close()
     return rows
@@ -227,24 +243,24 @@ def db_bewertet():
     con.close()
     return rows
 
-def db_hinzufuegen(titel, jahr, bewertung, genre, laufzeit=None, imdb_bewertung=None, imdb_id=None):
+def db_hinzufuegen(titel, jahr, bewertung, genre, laufzeit=None, imdb_bewertung=None, imdb_id=None, poster_url=None):
     con = sqlite3.connect(DB_FILE)
     cur = con.cursor()
     cur.execute(
-        """INSERT INTO filme (titel, jahr, bewertung, genre, laufzeit, imdb_bewertung, imdb_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (titel, jahr, bewertung, genre, laufzeit, imdb_bewertung, imdb_id)
+        """INSERT INTO filme (titel, jahr, bewertung, genre, laufzeit, imdb_bewertung, imdb_id, poster_url)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (titel, jahr, bewertung, genre, laufzeit, imdb_bewertung, imdb_id, poster_url)
     )
     con.commit()
     con.close()
 
-def db_bearbeiten(film_id, titel, jahr, bewertung, genre, laufzeit=None, imdb_bewertung=None, imdb_id=None):
+def db_bearbeiten(film_id, titel, jahr, bewertung, genre, laufzeit=None, imdb_bewertung=None, imdb_id=None, poster_url=None):
     con = sqlite3.connect(DB_FILE)
     cur = con.cursor()
     cur.execute(
         """UPDATE filme SET titel=?, jahr=?, bewertung=?, genre=?,
-           laufzeit=?, imdb_bewertung=?, imdb_id=? WHERE id=?""",
-        (titel, jahr, bewertung, genre, laufzeit, imdb_bewertung, imdb_id, film_id)
+           laufzeit=?, imdb_bewertung=?, imdb_id=?, poster_url=? WHERE id=?""",
+        (titel, jahr, bewertung, genre, laufzeit, imdb_bewertung, imdb_id, poster_url, film_id)
     )
     con.commit()
     con.close()
@@ -259,7 +275,17 @@ def db_loeschen(film_id):
 def db_gesehen_toggle(film_id, wert):
     con = sqlite3.connect(DB_FILE)
     cur = con.cursor()
-    cur.execute("UPDATE filme SET gesehen=? WHERE id=?", (wert, film_id))
+    if wert == 1:
+        zeit = datetime.now().isoformat()
+        cur.execute(
+            "UPDATE filme SET gesehen=?, gesehen_am=? WHERE id=?",
+            (1, zeit, film_id)
+        )
+    else:
+        cur.execute(
+            "UPDATE filme SET gesehen=?, gesehen_am=NULL WHERE id=?",
+            (0, film_id)
+        )
     con.commit()
     con.close()
 
@@ -309,6 +335,12 @@ class FilmApp(tk.Tk):
         self.geometry("1300x740")
         self.minsize(1050, 620)
         self.configure(bg=BG)
+        self._row_cache = {}
+        self._hover_popup = None
+        self._hover_img = None
+        self._hover_iid = None
+        self._hover_cache = {}
+        self._poster_image_cache = {}
         self._style()
         self._build_ui()
         self.aktualisieren()
@@ -448,6 +480,10 @@ class FilmApp(tk.Tk):
         btn(action, "✏  Bearbeiten", ACCENT2,    "#fff", lambda: self.film_bearbeiten_dialog(tree)).pack(fill="x", pady=(0, 4))
         btn(action, "🗑  Löschen",    "#3a1a2e", ACCENT, lambda: self.film_loeschen(tree)).pack(fill="x")
 
+        # Hover-Poster
+        tree.bind("<Motion>", lambda e, tr=tree: self._hover_im_tree(e, tr))
+        tree.bind("<Leave>", lambda e: self._hide_hover_poster())
+
         frame._tree = tree
         return frame
 
@@ -498,14 +534,16 @@ class FilmApp(tk.Tk):
     def _fill_tree(self, tree, rows):
         tree.delete(*tree.get_children())
         for r in rows:
-            # Reihenfolge aus _alle_felder(): id, titel, jahr, bewertung, genre, gesehen, laufzeit, imdb_bewertung, imdb_id
-            fid, titel, jahr, bew, genre, gesehen, laufzeit, imdb_bew, _ = r
+            # Reihenfolge aus _alle_felder(): id, titel, jahr, bewertung, genre, gesehen, laufzeit, imdb_bewertung, imdb_id, poster_url
+            fid, titel, jahr, bew, genre, gesehen, laufzeit, imdb_bew, imdb_id, poster_url, gesehen_am = r
+
+            self._row_cache[fid] = r
 
             bew_str      = f"{bew:.1f} / 10".replace(".", ",") if bew else "–"
             genre_str    = genre if genre else "–"
             laufzeit_str = f"{laufzeit} min" if laufzeit else "–"
             imdb_str     = f"{imdb_bew:.1f}" if imdb_bew else "–"
-            status       = "✅ Gesehen" if gesehen else "👁 Watchlist"
+            status       = f"✅ {gesehen_am[:10]}" if gesehen_am else "👁 Watchlist"
             tag          = "gesehen" if gesehen else "offen"
 
             tree.insert("", "end", iid=str(fid),
@@ -515,6 +553,120 @@ class FilmApp(tk.Tk):
 
         tree.tag_configure("gesehen", foreground=MUTED)
         tree.tag_configure("offen",   foreground=TEXT)
+
+    def _hover_im_tree(self, event, tree):
+        iid = tree.identify_row(event.y)
+
+        col = tree.identify_column(event.x) # nur für Titel anzeigen, wenn darauf gehovert wird
+        if col != "#1":
+            self._hide_hover_poster()
+            return
+
+        if not iid:
+            self._hide_hover_poster()
+            return
+
+        # Selbe Zeile wie vorher – nichts zu tun
+        if self._hover_iid == iid:
+            return
+
+        self._hover_iid = iid
+        row = self._row_cache.get(int(iid))
+        if not row:
+            self._hide_hover_poster()
+            return
+
+        imdb_id = row[8]
+        poster_url = row[9]
+
+        # Poster-URL schon in der DB gespeichert – direkt anzeigen
+        if poster_url:
+            self._show_hover_poster(event.x_root, event.y_root, poster_url, imdb_id)
+            return
+
+        # Schon mal von IMDb geholt – aus dem RAM-Cache nehmen
+        if imdb_id and imdb_id in self._hover_cache:
+            self._show_hover_poster(event.x_root, event.y_root, self._hover_cache[imdb_id], imdb_id)
+            return
+
+        # Noch gar nicht da – im Hintergrund nachladen
+        if imdb_id:
+            threading.Thread(target=self._hover_fetch_poster,
+                             args=(imdb_id, event.x_root, event.y_root),
+                             daemon=True).start()
+
+    def _hover_fetch_poster(self, imdb_id, x, y):
+        details = imdb_details(imdb_id)
+        poster_url = details.get("poster_url") if details else None
+        if poster_url:
+            self._hover_cache[imdb_id] = poster_url
+        self.after(0, lambda: self._show_hover_poster(x, y, poster_url, imdb_id))
+
+    def _show_hover_poster(self, x, y, poster_url, imdb_id=None):
+        if not poster_url:
+            return
+        self._hide_hover_poster()
+
+        # Bild schon als PhotoImage im Cache – direkt Popup aufmachen
+        if imdb_id and imdb_id in self._poster_image_cache:
+            popup = tk.Toplevel(self)
+            popup.overrideredirect(True)
+            popup.attributes("-topmost", True)
+            popup.configure(bg=CARD)
+            popup.geometry(f"+{x+18}+{y+18}")
+            self._hover_popup = popup
+            lbl = tk.Label(popup, bg=CARD, bd=1, relief="solid", image=self._poster_image_cache[imdb_id])
+            lbl.pack()
+            self._hover_img = self._poster_image_cache[imdb_id]
+            return
+
+        # noch kein PhotoImage - Popup anlegen und Bild im Hintergrund laden
+        popup = tk.Toplevel(self)
+        popup.overrideredirect(True)
+        popup.attributes("-topmost", True)
+        popup.configure(bg=CARD)
+        popup.geometry(f"+{x+18}+{y+18}")
+        self._hover_popup = popup
+
+        lbl = tk.Label(popup, bg=CARD, bd=1, relief="solid")
+        lbl.pack()
+
+        def load():
+            try:
+                from PIL import Image, ImageTk, ImageOps
+                import io
+                resp = requests.get(poster_url, timeout=8)
+                resp.raise_for_status()
+                img = Image.open(io.BytesIO(resp.content)).convert("RGB")
+                img = ImageOps.contain(img, (260, 390), Image.LANCZOS)
+                photo = ImageTk.PhotoImage(img)
+                if imdb_id:
+                    self._poster_image_cache[imdb_id] = photo
+
+                def ui():
+                    if not self.winfo_exists():
+                        return
+                    try:
+                        self._hover_img = photo
+                        lbl.configure(image=photo)
+                    except tk.TclError:
+                        pass
+
+                self.after(0, ui)
+            except Exception:
+                self.after(0, self._hide_hover_poster)
+
+        threading.Thread(target=load, daemon=True).start()
+
+    def _hide_hover_poster(self):
+        self._hover_iid = None
+        if self._hover_popup is not None:
+            try:
+                self._hover_popup.destroy()
+            except Exception:
+                pass
+            self._hover_popup = None
+            self._hover_img = None
 
     # ── Navigation ─────────────────────────────────────────
 
@@ -549,8 +701,8 @@ class FilmApp(tk.Tk):
     def film_hinzufuegen_dialog(self):
         FilmDialog(self, titel="Film hinzufügen", callback=self._film_speichern)
 
-    def _film_speichern(self, titel, jahr, bewertung, genre, laufzeit, imdb_bewertung, imdb_id):
-        db_hinzufuegen(titel, jahr, bewertung, genre, laufzeit, imdb_bewertung, imdb_id)
+    def _film_speichern(self, titel, jahr, bewertung, genre, laufzeit, imdb_bewertung, imdb_id, poster_url):
+        db_hinzufuegen(titel, jahr, bewertung, genre, laufzeit, imdb_bewertung, imdb_id, poster_url)
         self.aktualisieren()
 
     def film_bearbeiten_dialog(self, tree):
@@ -565,10 +717,10 @@ class FilmApp(tk.Tk):
         if not row:
             return
 
-        _, titel, jahr, bew, genre, _, laufzeit, imdb_bew, imdb_id = row
+        _, titel, jahr, bew, genre, _, laufzeit, imdb_bew, imdb_id, poster_url, _ = row
 
-        def save(t, j, b, g, lz, ib, iid):
-            db_bearbeiten(fid, t, j, b, g, lz, ib, iid)
+        def save(t, j, b, g, lz, ib, iid, purl):
+            db_bearbeiten(fid, t, j, b, g, lz, ib, iid, purl)
             self.aktualisieren()
 
         FilmDialog(
@@ -583,6 +735,7 @@ class FilmApp(tk.Tk):
                 str(laufzeit) if laufzeit else "",
                 str(imdb_bew) if imdb_bew else "",
                 imdb_id or "",
+                poster_url or "",
             )
         )
 
@@ -592,6 +745,8 @@ class FilmApp(tk.Tk):
 #  Popup zum Anlegen oder Bearbeiten. Titel ist Pflichtfeld,
 #  der Rest ist optional. Mit IMDb-Suche: Titel eintippen,
 #  auf "IMDb suchen" klicken, Treffer auswählen – fertig.
+#  Poster wird direkt im Dialog angezeigt sobald ein Treffer geladen ist.
+#  Braucht optional: pip install Pillow
 # ──────────────────────────────────────────────────────────────
 
 class FilmDialog(tk.Toplevel):
@@ -603,6 +758,8 @@ class FilmDialog(tk.Toplevel):
         self.grab_set()  # Blockiert die Hauptapp solange der Dialog offen ist
         self.callback = callback
         self._imdb_id = None  # wird gesetzt wenn man was von IMDb auswählt
+        self._poster_url = None
+        self._poster_ref = None  # GC-Schutz für Tkinter PhotoImage
         self._build(titel, prefill)
         # Dialog mittig über dem Hauptfenster positionieren
         self.update_idletasks()
@@ -685,7 +842,7 @@ class FilmDialog(tk.Toplevel):
 
         # Felder vorausfüllen wenn wir einen bestehenden Film bearbeiten
         if prefill:
-            titel_str, jahr_str, bew_str, genre_str, laufzeit_str, imdb_str, imdb_id = prefill
+            titel_str, jahr_str, bew_str, genre_str, laufzeit_str, imdb_str, imdb_id, poster_url = prefill
             self.e_titel.insert(0,    titel_str)
             self.e_jahr.insert(0,     jahr_str)
             self.e_bew.insert(0,      bew_str)
@@ -693,6 +850,7 @@ class FilmDialog(tk.Toplevel):
             self.e_laufzeit.insert(0, laufzeit_str)
             self.e_imdb.insert(0,     imdb_str)
             self._imdb_id = imdb_id or None
+            self._poster_url = poster_url or None
 
         # Buttons ganz unten
         btn_frame = tk.Frame(left, bg=CARD)
@@ -707,22 +865,29 @@ class FilmDialog(tk.Toplevel):
         # ── rechte Spalte: IMDb-Suchergebnisse ──────────────
         tk.Frame(outer, bg=BORDER, width=1).pack(side="left", fill="y")
 
-        right = tk.Frame(outer, bg=CARD, width=255)
+        right = tk.Frame(outer, bg=CARD, width=520)
         right.pack(side="left", fill="y", padx=(16, 20), pady=24)
         right.pack_propagate(False)
 
         tk.Label(right, text="IMDb Suchergebnisse", font=("Segoe UI", 11, "bold"),
                  bg=CARD, fg=TEXT).pack(anchor="w")
         tk.Label(right, text="Titel eingeben → 🔍 IMDb klicken",
-                 font=("Segoe UI", 8), bg=CARD, fg=MUTED).pack(anchor="w", pady=(2, 6))
+                 font=("Segoe UI", 8), bg=CARD, fg=MUTED).pack(anchor="w", pady=(2, 8))
 
-        # Status: "Suche läuft…", Trefferzahl oder Fehlermeldung
-        self.status_lbl = tk.Label(right, text="", font=("Segoe UI", 9, "italic"),
+        # Suchergebnisse links, Poster rechts daneben
+        body_right = tk.Frame(right, bg=CARD)
+        body_right.pack(fill="both", expand=True)
+
+        left_res = tk.Frame(body_right, bg=CARD)
+        left_res.pack(side="left", fill="both", expand=True)
+
+        # Status: "Suche läuft", Trefferzahl oder Fehlermeldung
+        self.status_lbl = tk.Label(left_res, text="", font=("Segoe UI", 9, "italic"),
                                    bg=CARD, fg=MUTED, wraplength=230)
         self.status_lbl.pack(anchor="w", pady=(0, 6))
 
         # Die eigentliche Trefferliste
-        self.treffer_list = tk.Listbox(right, bg="#0d0d14", fg=TEXT,
+        self.treffer_list = tk.Listbox(left_res, bg="#0d0d14", fg=TEXT,
                                        selectbackground=ACCENT, selectforeground="#fff",
                                        font=("Segoe UI", 10), bd=0, relief="flat",
                                        highlightthickness=1, highlightbackground=BORDER,
@@ -730,8 +895,64 @@ class FilmDialog(tk.Toplevel):
         self.treffer_list.pack(fill="both", expand=True)
         self.treffer_list.bind("<<ListboxSelect>>", self._treffer_ausgewaehlt)
 
+        # Poster-Vorschau rechts neben der Trefferliste
+        preview = tk.Frame(body_right, bg=CARD)
+        preview.pack(side="left", fill="y", padx=(14, 0))
+
+        tk.Label(preview, text="Poster", font=("Segoe UI", 9, "bold"),
+                 bg=CARD, fg=MUTED).pack(anchor="w")
+
+        # Canvas als feste Poster-Fläche – 220×330 px (typisches Filmplakat-Seitenverhältnis)
+        self.poster_canvas = tk.Canvas(preview, bg="#0d0d14", width=220, height=330,
+                                       bd=0, highlightthickness=1, highlightbackground=BORDER)
+        self.poster_canvas.pack(pady=(4, 0))
+        self._poster_platzhalter()
+
         # Intern: die rohen Trefferdaten (id, titel, jahr) zur späteren Detailabfrage
         self._treffer_daten = []
+
+    def _poster_platzhalter(self):
+        """Dezenter Platzhalter wenn noch kein Poster geladen ist."""
+        self.poster_canvas.delete("all")
+        self.poster_canvas.create_rectangle(0, 0, 220, 330, fill="#0d0d14", outline="")
+        self.poster_canvas.create_text(110, 145, text="🎬", font=("Segoe UI", 34), fill=BORDER)
+        self.poster_canvas.create_text(110, 195, text="kein Poster",
+                                       font=("Segoe UI", 9), fill=MUTED)
+
+    def _poster_laden(self, url: str):
+        """
+        Startet das Laden des Posters im Hintergrundthread.
+        Braucht Pillow (pip install Pillow) – ohne Pillow bleibt
+        der Platzhalter und es kommt ein Hinweis im Status.
+        """
+        def fetch():
+            try:
+                from PIL import Image, ImageTk, ImageOps
+                import io
+                resp = requests.get(url, timeout=8)
+                resp.raise_for_status()
+                img = Image.open(io.BytesIO(resp.content)).convert("RGB")
+                img = ImageOps.contain(img, (220, 330), Image.LANCZOS)
+                photo = ImageTk.PhotoImage(img)
+                # Zurück in den Main-Thread – Tkinter ist nicht thread-safe
+                self.after(0, lambda: self._poster_zeigen(photo))
+            except ImportError:
+                self.after(0, lambda: self.status_lbl.config(
+                    text="✓ Felder ausgefüllt!\n(Poster: pip install Pillow)", fg=SUCCESS))
+            except Exception:
+                self.after(0, lambda: self.status_lbl.config(
+                    text="✓ Felder ausgefüllt! (Poster nicht ladbar)", fg=SUCCESS))
+
+        threading.Thread(target=fetch, daemon=True).start()
+
+    def _poster_zeigen(self, photo):
+        """Trägt das fertig geladene Bild in den Canvas ein."""
+        if not self.winfo_exists():
+            return
+        self._poster_ref = photo  # Referenz halten sonst räumt GC das Bild weg
+        self.poster_canvas.delete("all")
+        self.poster_canvas.create_image(110, 165, image=photo, anchor="center")
+        self.status_lbl.config(text="✓ Felder ausgefüllt!", fg=SUCCESS)
 
     def _imdb_suchen(self):
         """Startet die IMDb-Suche in einem eigenen Thread damit die UI nicht einfriert."""
@@ -751,6 +972,8 @@ class FilmDialog(tk.Toplevel):
         self.status_lbl.config(text="Suche läuft…", fg=WARNING)
         self.treffer_list.delete(0, "end")
         self._treffer_daten = []
+        self._poster_platzhalter()
+        self._poster_ref = None
 
         # In separatem Thread damit die UI nicht hängt
         threading.Thread(target=self._suche_thread, args=(titel,), daemon=True).start()
@@ -805,6 +1028,7 @@ class FilmDialog(tk.Toplevel):
         # Alle Felder leeren und mit IMDb-Daten befüllen
         # Eigene Bewertung lassen wir absichtlich in Ruhe – die ist persönlich
         self._imdb_id = details.get("imdb_id") or f"tt{movie_id}"
+        self._poster_url = details.get("poster_url") or None
 
         self.e_titel.delete(0, "end")
         self.e_titel.insert(0, details["titel"])
@@ -823,7 +1047,12 @@ class FilmDialog(tk.Toplevel):
         if details["imdb_bewertung"]:
             self.e_imdb.insert(0, str(details["imdb_bewertung"]))
 
-        self.status_lbl.config(text="✓ Felder wurden ausgefüllt!", fg=SUCCESS)
+        # Poster direkt im Dialog anzeigen
+        poster_url = details.get("poster_url")
+        if poster_url:
+            self._poster_laden(poster_url)
+        else:
+            self.status_lbl.config(text="✓ Felder ausgefüllt! (kein Poster verfügbar)", fg=SUCCESS)
 
     def _speichern(self):
         # Titel prüfen
@@ -883,7 +1112,7 @@ class FilmDialog(tk.Toplevel):
 
         genre = self.e_genre.get().strip() or None
 
-        self.callback(titel, jahr, bewertung, genre, laufzeit, imdb_bewertung, self._imdb_id)
+        self.callback(titel, jahr, bewertung, genre, laufzeit, imdb_bewertung, self._imdb_id, self._poster_url)
         self.destroy()
 
 
