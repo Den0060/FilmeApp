@@ -289,6 +289,17 @@ def db_gesehen_toggle(film_id, wert):
     con.commit()
     con.close()
 
+def db_titel_existiert(titel: str, ausnahme_id: int | None = None) -> bool:
+    # Funktion um in der Datenbank auf Duplikate zu prüfen
+    con = sqlite3.connect(DB_FILE)
+    cur = con.cursor()
+    if ausnahme_id:
+        cur.execute("SELECT 1 FROM filme WHERE LOWER(titel)=LOWER(?) AND id != ?", (titel, ausnahme_id))
+    else:
+        cur.execute("SELECT 1 FROM filme WHERE LOWER(titel)=LOWER(?)", (titel,))
+    row = cur.fetchone()
+    con.close()
+    return row is not None
 
 # ──────────────────────────────────────────────────────────────
 #  FARBEN & DESIGN
@@ -736,7 +747,8 @@ class FilmApp(tk.Tk):
                 str(imdb_bew) if imdb_bew else "",
                 imdb_id or "",
                 poster_url or "",
-            )
+            ),
+            film_id = fid
         )
 
 
@@ -750,13 +762,14 @@ class FilmApp(tk.Tk):
 # ──────────────────────────────────────────────────────────────
 
 class FilmDialog(tk.Toplevel):
-    def __init__(self, parent, titel, callback, prefill=None):
+    def __init__(self, parent, titel, callback, prefill=None, film_id=None):
         super().__init__(parent)
         self.title(titel)
         self.configure(bg=CARD)
         self.resizable(False, False)
         self.grab_set()  # Blockiert die Hauptapp solange der Dialog offen ist
         self.callback = callback
+        self._film_id = film_id # None = neuer Film, int = Bearbeitung
         self._imdb_id = None  # wird gesetzt wenn man was von IMDb auswählt
         self._poster_url = None
         self._poster_ref = None  # GC-Schutz für Tkinter PhotoImage
@@ -1059,6 +1072,13 @@ class FilmDialog(tk.Toplevel):
         titel = self.e_titel.get().strip()
         if not titel:
             messagebox.showerror("Fehler", "Titel ist ein Pflichtfeld!", parent=self)
+            return
+        if db_titel_existiert(titel, ausnahme_id=self._film_id):
+            messagebox.showwarning(
+                "Duplikat",
+                f'„{titel}" ist bereits in deiner Sammlung!',
+                parent=self
+            )
             return
 
         # Jahr prüfen – leer ist ok, aber wenn was drin steht muss es eine Zahl sein
