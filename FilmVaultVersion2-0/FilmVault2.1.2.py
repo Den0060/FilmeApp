@@ -681,10 +681,20 @@ class FilmApp(tk.Tk):
 
     # ── Navigation ─────────────────────────────────────────
 
-    def zeige_alle(self):      self.frame_alle.lift()
-    def zeige_watchlist(self): self.frame_watchlist.lift()
-    def zeige_bewertet(self):   self.frame_bewertet.lift()
+    def zeige_alle(self):
+        self._hide_hover_poster()
+        self.frame_alle.lift()
+
+    def zeige_watchlist(self):
+        self._hide_hover_poster()
+        self.frame_watchlist.lift()
+
+    def zeige_bewertet(self):
+        self._hide_hover_poster()
+        self.frame_bewertet.lift()
+
     def zeige_rad(self):
+        self._hide_hover_poster()
         self.frame_rad.lift()
         self.frame_rad.lade_filme()
 
@@ -1148,6 +1158,7 @@ class GluecksradFrame(tk.Frame):
         super().__init__(parent, bg=BG)
         self.filme    = []  # Liste von (id, titel) – nur ungesehene
         self.vars     = []  # BooleanVar pro Film – ist er im Rad?
+        self.counts   = []  # NEU: IntVar für Anzahl pro Film (doppelte Chancen)
         self.spinning = False
         self.angle    = 0.0
         self._build()
@@ -1216,19 +1227,30 @@ class GluecksradFrame(tk.Frame):
 
     def lade_filme(self):
         """Filmliste neu laden – wird aufgerufen wenn man zum Rad-Tab wechselt."""
-        self.filme = [(r[0], r[1]) for r in db_ungesehen()]
-        self.vars  = [tk.BooleanVar(value=True) for _ in self.filme]
+        self.filme  = [(r[0], r[1]) for r in db_ungesehen()]
+        self.vars   = [tk.BooleanVar(value=True) for _ in self.filme]
+        self.counts = [tk.IntVar(value=1)        for _ in self.filme]  # NEU
 
         for w in self.inner.winfo_children():
             w.destroy()
 
         for i, (fid, titel) in enumerate(self.filme):
-            cb = tk.Checkbutton(self.inner, text=titel, variable=self.vars[i],
+            zeile = tk.Frame(self.inner, bg=PANEL)
+            zeile.pack(fill="x", pady=2, padx=4)
+
+            cb = tk.Checkbutton(zeile, text=titel, variable=self.vars[i],
                                 bg=PANEL, fg=TEXT, selectcolor=ACCENT2,
                                 activebackground=PANEL, activeforeground=TEXT,
                                 font=("Segoe UI", 10), anchor="w", cursor="hand2",
                                 command=self._zeichne_rad)
-            cb.pack(fill="x", pady=2, padx=4)
+            cb.pack(side="left", fill="x", expand=True)
+
+            sp = tk.Spinbox(zeile, from_=1, to=5, width=2,
+                            textvariable=self.counts[i],
+                            bg="#0d0d14", fg=TEXT, buttonbackground=BORDER,
+                            highlightthickness=0, bd=0, font=("Segoe UI", 9),
+                            command=self._zeichne_rad)
+            sp.pack(side="right")
 
         self._zeichne_rad()
 
@@ -1241,8 +1263,13 @@ class GluecksradFrame(tk.Frame):
         self._zeichne_rad()
 
     def _aktive_filme(self):
-        """Gibt nur die Filme zurück die aktuell angehakt sind."""
-        return [self.filme[i][1] for i in range(len(self.filme)) if self.vars[i].get()]
+        """Gibt die aktiven Filme zurück – mehrfach wenn count > 1."""
+        result = []
+        for i in range(len(self.filme)):
+            if self.vars[i].get():
+                anzahl = max(1, min(5, self.counts[i].get()))  # NEU: 1–5x
+                result.extend([self.filme[i][1]] * anzahl)
+        return result
 
     def _zeichne_rad(self, winkel_offset=0):
         """Rad komplett neu zeichnen – wird bei jedem Animations-Frame aufgerufen."""
@@ -1262,23 +1289,39 @@ class GluecksradFrame(tk.Frame):
         n    = len(filme)
         step = 360 / n
 
-        for i, titel in enumerate(filme):
-            start = winkel_offset + i * step
-            farbe = WHEEL_COLORS[i % len(WHEEL_COLORS)]
+        # Jedem einzigartigen Film eine feste Farbe zuweisen
+        einzigartig = list(dict.fromkeys(filme))  # Reihenfolge beibehalten, Duplikate raus
+        film_farbe  = {titel: WHEEL_COLORS[i % len(WHEEL_COLORS)] for i, titel in enumerate(einzigartig)}
+
+        # Zusammengehörende Sektoren zu Gruppen zusammenfassen
+        gruppen = []  # Liste von (titel, start_index, anzahl)
+        i = 0
+        while i < n:
+            titel = filme[i]
+            count = 1
+            while i + count < n and filme[i + count] == titel:
+                count += 1
+            gruppen.append((titel, i, count))
+            i += count
+
+        for titel, start_idx, count in gruppen:
+            start     = winkel_offset + start_idx * step
+            extent    = step * count
+            farbe     = film_farbe[titel]
 
             self.canvas.create_arc(cx-r, cy-r, cx+r, cy+r,
-                                   start=start, extent=step,
+                                   start=start, extent=extent,
                                    fill=farbe, outline=BG, width=2, style="pieslice")
 
-            # Filmtitel in den Sektor schreiben, bei langen Namen abschneiden
-            mid_angle = math.radians(start + step / 2)
+            # Titel mittig in den zusammengefassten Block schreiben
+            mid_angle = math.radians(start + extent / 2)
             tr = r * 0.62
             tx = cx + tr * math.cos(mid_angle)
             ty = cy - tr * math.sin(mid_angle)
             kurz = (titel[:15] + "…") if len(titel) > 15 else titel
             self.canvas.create_text(tx, ty, text=kurz, fill="#fff",
                                     font=("Segoe UI", 8, "bold"),
-                                    angle=-(start + step / 2),
+                                    angle=-(start + extent / 2),
                                     width=90, justify="center")
 
         # Mittelpunkt-Kreis damit es nicht so nackt aussieht
