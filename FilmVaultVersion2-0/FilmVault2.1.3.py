@@ -1225,6 +1225,12 @@ class GluecksradFrame(tk.Frame):
                                   command=self.starten)
         self.spin_btn.pack()
 
+    def _kuerze_titel(self, titel, max_len=24):
+        # nur um Titel beim Glücksrad zu kürzen
+        if len(titel) <= max_len:
+            return titel
+        return titel[:max_len - 3].rstrip() + "..."
+
     def lade_filme(self):
         """Filmliste neu laden – wird aufgerufen wenn man zum Rad-Tab wechselt."""
         self.filme  = [(r[0], r[1]) for r in db_ungesehen()]
@@ -1238,7 +1244,9 @@ class GluecksradFrame(tk.Frame):
             zeile = tk.Frame(self.inner, bg=PANEL)
             zeile.pack(fill="x", pady=2, padx=4)
 
-            cb = tk.Checkbutton(zeile, text=titel, variable=self.vars[i],
+            kurzer_titel = self._kuerze_titel(titel, max_len=32)
+
+            cb = tk.Checkbutton(zeile, text=kurzer_titel, variable=self.vars[i],
                                 bg=PANEL, fg=TEXT, selectcolor=ACCENT2,
                                 activebackground=PANEL, activeforeground=TEXT,
                                 font=("Segoe UI", 10), anchor="w", cursor="hand2",
