@@ -9,6 +9,7 @@ import requests
 from dotenv import load_dotenv
 import os
 from datetime import datetime
+import ctypes
 
 # ──────────────────────────────────────────────────────────────
 #  IMDb via OMDb
@@ -301,6 +302,13 @@ def db_titel_existiert(titel: str, ausnahme_id: int | None = None) -> bool:
     con.close()
     return row is not None
 
+def db_bewertung_setzen(film_id, bewertung):
+    con = sqlite3.connect(DB_FILE)
+    cur = con.cursor()
+    cur.execute("UPDATE filme SET bewertung=? WHERE id=?", (bewertung, film_id))
+    con.commit()
+    con.close()
+
 # ──────────────────────────────────────────────────────────────
 #  FARBEN & DESIGN
 #  Dunkles Theme, Akzentfarbe Rot. Wheel-Farben einfach
@@ -333,6 +341,19 @@ GENRE_VORSCHLAEGE = [
     "Musical", "Romantik", "Sci-Fi", "Thriller", "Western"
 ]
 
+def set_dark_title_bar(window):
+    """
+    Erzwingt die schwarze Titelleiste für ein gegebenes Fenster unter Windows 10/11.
+    """
+    window.update()  # Wichtig, damit das Fenster eine ID (HWND) hat
+    DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+    set_window_attribute = ctypes.windll.dwmapi.DwmSetWindowAttribute
+    get_parent = ctypes.windll.user32.GetParent
+    hwnd = get_parent(window.winfo_id())
+    rendering_policy = ctypes.c_int(1)
+
+    set_window_attribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE,
+                         ctypes.byref(rendering_policy), ctypes.sizeof(rendering_policy))
 
 # ──────────────────────────────────────────────────────────────
 #  HAUPT-APP
@@ -706,7 +727,29 @@ class FilmApp(tk.Tk):
             messagebox.showinfo("Hinweis", "Erstmal einen Film auswählen!")
             return
         for iid in sel:
-            db_gesehen_toggle(int(iid), wert)
+            fid = int(iid)
+            row = self._row_cache.get(fid)
+
+            # Wenn auf "gesehen" gesetzt werden soll, vorher eigene Bewertung prüfen
+            if wert == 1:
+                eigene_bewertung = row[3] if row else None  # Spalte "bewertung"
+                if eigene_bewertung is None:
+                    titel = row[1] if row else "Film"
+                    dlg = BewertungDialog(self, filmtitel=titel)
+
+                    # Dark Mode Title Bar
+                    dlg.withdraw()
+                    set_dark_title_bar(dlg)
+                    dlg.deiconify()
+
+                    self.wait_window(dlg)
+
+                    if dlg.result is None:
+                        continue  # Abgebrochen -> Film nicht als gesehen markieren
+
+                    db_bewertung_setzen(fid, dlg.result)
+
+            db_gesehen_toggle(fid, wert)
         self.aktualisieren()
 
     def film_loeschen(self, tree):
@@ -777,6 +820,8 @@ class FilmDialog(tk.Toplevel):
         self.title(titel)
         self.configure(bg=CARD)
         self.resizable(False, False)
+
+        set_dark_title_bar(self) # Title Bar Darkmode !!! Problem: man sieht das sich die Farbe ändert, withdraw und deiconify verhindern aber irgendwie die richtige Positionierung des Fensters
         self.grab_set()  # Blockiert die Hauptapp solange der Dialog offen ist
         self.callback = callback
         self._film_id = film_id # None = neuer Film, int = Bearbeitung
@@ -786,9 +831,10 @@ class FilmDialog(tk.Toplevel):
         self._build(titel, prefill)
         # Dialog mittig über dem Hauptfenster positionieren
         self.update_idletasks()
-        x = parent.winfo_x() + (parent.winfo_width()  - self.winfo_width())  // 2
+        x = parent.winfo_x() + (parent.winfo_width()  - self.winfo_width()) // 2
         y = parent.winfo_y() + (parent.winfo_height() - self.winfo_height()) // 2
         self.geometry(f"+{x}+{y}")
+        self.focus_set() # Tastatur auf ein Fenster zuweisen separat zu grab_set() (Hauptfenster in Hintergrund)
 
     def _entry(self, master=None):
         """Einheitliches Entry-Widget im App-Style."""
@@ -1145,6 +1191,108 @@ class FilmDialog(tk.Toplevel):
         self.callback(titel, jahr, bewertung, genre, laufzeit, imdb_bewertung, self._imdb_id, self._poster_url)
         self.destroy()
 
+# ──────────────────────────────────────────────────────────────
+#  Bewertung-Dialog
+#  Taucht auf, sobald man einen Film als "gesehen" markieren
+#  möchte, dieser aber noch keine Bewertung (nicht die von
+#  Imdb) abgegeben hat
+# ──────────────────────────────────────────────────────────────
+
+class BewertungDialog(tk.Toplevel):
+    def __init__(self, parent, filmtitel=""):
+        super().__init__(parent)
+        self.result = None
+        self.title("Eigene Bewertung")
+        self.configure(bg=CARD)
+        self.resizable(False, False)
+        self.grab_set()
+        self.transient(parent)
+
+        tk.Label(
+            self,
+            text=f"Eigene Bewertung für:\n{filmtitel}",
+            bg=CARD,
+            fg=TEXT,
+            font=("Segoe UI", 11, "bold"),
+            justify="left"
+        ).pack(anchor="w", padx=18, pady=(16, 8))
+
+        tk.Label(
+            self,
+            text="Bewertung (1–10):",
+            bg=CARD,
+            fg=MUTED,
+            font=("Segoe UI", 9, "bold")
+        ).pack(anchor="w", padx=18)
+
+        self.eingabe = tk.Entry(
+            self,
+            bg="#0d0d14",
+            fg=TEXT,
+            insertbackground=TEXT,
+            font=("Segoe UI", 11),
+            bd=0,
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground=BORDER,
+            highlightcolor=ACCENT
+        )
+        self.eingabe.pack(fill="x", padx=18, pady=(4, 14))
+        self.eingabe.focus_set()
+
+        btns = tk.Frame(self, bg=CARD)
+        btns.pack(fill="x", padx=18, pady=(0, 16))
+
+        tk.Button(
+            btns,
+            text="Speichern",
+            bg=ACCENT,
+            fg="#fff",
+            font=("Segoe UI", 10, "bold"),
+            bd=0,
+            padx=16,
+            pady=8,
+            cursor="hand2",
+            command=self._ok
+        ).pack(side="right", padx=(8, 0))
+
+        tk.Button(
+            btns,
+            text="Abbrechen",
+            bg=BORDER,
+            fg=TEXT,
+            font=("Segoe UI", 10),
+            bd=0,
+            padx=16,
+            pady=8,
+            cursor="hand2",
+            command=self.destroy
+        ).pack(side="right")
+
+        self.bind("<Return>", lambda e: self._ok())
+        self.bind("<Escape>", lambda e: self.destroy())
+
+        self.update_idletasks()
+        x = parent.winfo_x() + (parent.winfo_width() - self.winfo_width()) // 2
+        y = parent.winfo_y() + (parent.winfo_height() - self.winfo_height()) // 2
+        self.geometry(f"+{x}+{y}")
+
+    def _ok(self):
+        wert = self.eingabe.get().strip().replace(",", ".")
+        try:
+            wert = float(wert)
+            if not (1 <= wert <= 10):
+                raise ValueError
+        except ValueError:
+            messagebox.showerror(
+                "Fehler",
+                "Bitte eine Zahl zwischen 1 und 10 eingeben.",
+                parent=self
+            )
+            return
+
+        self.result = wert
+        self.destroy()
 
 # ──────────────────────────────────────────────────────────────
 #  GLÜCKSRAD
@@ -1429,4 +1577,7 @@ class GluecksradFrame(tk.Frame):
 
 if __name__ == "__main__":
     app = FilmApp()
+    app.withdraw() # App verstecken
+    set_dark_title_bar(app)
+    app.deiconify() # App anzeigen, nachdem Windows Title Bar schwarz ist, damit man den Übergang nicht sieht
     app.mainloop()
