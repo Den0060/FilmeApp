@@ -250,7 +250,7 @@ def _set_sync_cursor(value: str):
 
 # Felder hier als Konstante damit _db_fetch_by_id sie nutzen kann
 # bevor _alle_felder() weiter unten definiert wird
-_FELDER = "id, titel, jahr, bewertung, genre, gesehen, laufzeit, imdb_bewertung, imdb_id, poster_url, gesehen_am, updated_at, deleted"
+_FELDER = "id, titel, jahr, bewertung, genre, gesehen, laufzeit, imdb_bewertung, imdb_id, poster_url, gesehen_am, updated_at"
 
 def _db_fetch_by_id(fid: int):
     """Einen einzelnen Film aus der DB holen – für den Firestore-Push."""
@@ -276,7 +276,7 @@ def firestore_push_film(film_id: int):
         return False
 
     # Alles was Firestore braucht direkt aus der Row bauen
-    fid, titel, jahr, bew, genre, gesehen, laufzeit, imdb_bew, imdb_id, poster_url, gesehen_am, updated_at, deleted = row
+    fid, titel, jahr, bew, genre, gesehen, laufzeit, imdb_bew, imdb_id, poster_url, gesehen_am, updated_at = row
     payload = {
         "id":            fid,
         "titel":         titel,
@@ -290,7 +290,6 @@ def firestore_push_film(film_id: int):
         "poster_url":    poster_url,
         "gesehen_am":    gesehen_am,
         "updated_at":    updated_at,
-        "deleted":       int(deleted or 0),
     }
     try:
         client.collection(FIRESTORE_COLLECTION).document(str(fid)).set(payload, merge=True)
@@ -299,6 +298,18 @@ def firestore_push_film(film_id: int):
         print(f"Firestore-Push fehlgeschlagen für Film {film_id}:")
         traceback.print_exc()
         return False
+
+
+def firestore_delete_film(film_id: int):
+    """Löscht ein Firestore-Dokument komplett – kein Soft-Delete."""
+    client = _get_firestore_client()
+    if client is None:
+        return
+    try:
+        client.collection(FIRESTORE_COLLECTION).document(str(film_id)).delete()
+    except Exception:
+        print(f"Firestore-Delete fehlgeschlagen für Film {film_id}:")
+        traceback.print_exc()
 
 
 def firestore_pull_updates(force_full: bool = False) -> bool:
@@ -349,17 +360,12 @@ def firestore_pull_updates(force_full: bool = False) -> bool:
             if fid is None:
                 continue
 
-            # Soft-Delete: lokal einfach rauswerfen
-            if int(data.get("deleted") or 0):
-                cur.execute("DELETE FROM filme WHERE id=?", (fid,))
-                continue
-
             cur.execute("""
                 INSERT INTO filme
                     (id, titel, jahr, bewertung, genre, gesehen, laufzeit, imdb_bewertung,
-                     imdb_id, poster_url, gesehen_am, updated_at, deleted)
+                     imdb_id, poster_url, gesehen_am, updated_at)
                 VALUES
-                    (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                    (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     titel=excluded.titel,
                     jahr=excluded.jahr,
@@ -371,8 +377,7 @@ def firestore_pull_updates(force_full: bool = False) -> bool:
                     imdb_id=excluded.imdb_id,
                     poster_url=excluded.poster_url,
                     gesehen_am=excluded.gesehen_am,
-                    updated_at=excluded.updated_at,
-                    deleted=0
+                    updated_at=excluded.updated_at
             """, (
                 fid,
                 data.get("titel") or "",
@@ -426,8 +431,7 @@ def db_init():
             imdb_id        TEXT,       -- z.B. tt0111161
             poster_url     TEXT,
             gesehen_am     TEXT,
-            updated_at     TEXT,       -- für inkrementellen Firestore-Sync
-            deleted        INTEGER DEFAULT 0  -- Soft-Delete statt echter Löschung
+            updated_at     TEXT       -- für inkrementellen Firestore-Sync
         )
     """)
     # Metatabelle für den Sync-Cursor
@@ -442,7 +446,6 @@ def db_init():
         ("poster_url",     "TEXT"),
         ("gesehen_am",     "TEXT"),
         ("updated_at",     "TEXT"),
-        ("deleted",        "INTEGER DEFAULT 0"),
     ]:
         try:
             cur.execute(f"ALTER TABLE filme ADD COLUMN {spalte} {typ}")
@@ -452,7 +455,7 @@ def db_init():
     # Bestehende Zeilen ohne updated_at auf einen sinnvollen Default setzen
     try:
         cur.execute(
-            "UPDATE filme SET updated_at = COALESCE(updated_at, ?), deleted = COALESCE(deleted, 0)",
+            "UPDATE filme SET updated_at = COALESCE(updated_at, ?)",
             ("1970-01-01T00:00:00Z",)
         )
     except Exception:
@@ -462,7 +465,7 @@ def db_init():
     con.close()
 
 def _alle_felder():
-    return "id, titel, jahr, bewertung, genre, gesehen, laufzeit, imdb_bewertung, imdb_id, poster_url, gesehen_am, updated_at, deleted"
+    return "id, titel, jahr, bewertung, genre, gesehen, laufzeit, imdb_bewertung, imdb_id, poster_url, gesehen_am, updated_at"
 
 def db_alle():
     # Standardsortierung: zuletzt gesehen oben, danach titel
@@ -471,7 +474,6 @@ def db_alle():
     cur.execute(f"""
         SELECT {_alle_felder()}
         FROM filme
-        WHERE COALESCE(deleted, 0) = 0
         ORDER BY
             gesehen DESC,
             gesehen_am DESC,
@@ -485,7 +487,7 @@ def db_ungesehen():
     # Nur die Filme die noch auf der Watchlist sind
     con = sqlite3.connect(DB_FILE)
     cur = con.cursor()
-    cur.execute(f"SELECT {_alle_felder()} FROM filme WHERE COALESCE(deleted,0)=0 AND gesehen=0 ORDER BY titel")
+    cur.execute(f"SELECT {_alle_felder()} FROM filme WHERE gesehen=0 ORDER BY titel")
     rows = cur.fetchall()
     con.close()
     return rows
@@ -497,7 +499,7 @@ def db_bewertet():
     cur.execute(f"""
         SELECT {_alle_felder()}
         FROM filme
-        WHERE COALESCE(deleted,0)=0 AND bewertung IS NOT NULL
+        WHERE bewertung IS NOT NULL
         ORDER BY bewertung DESC, titel
     """)
     rows = cur.fetchall()
@@ -510,8 +512,8 @@ def db_hinzufuegen(titel, jahr, bewertung, genre, laufzeit=None, imdb_bewertung=
     updated_at = _now_iso()
     cur.execute(
         """INSERT INTO filme (titel, jahr, bewertung, genre, laufzeit, imdb_bewertung, imdb_id, poster_url,
-                              gesehen, gesehen_am, updated_at, deleted)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, 0)""",
+                              gesehen, gesehen_am, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?)""",
         (titel, jahr, bewertung, genre, laufzeit, imdb_bewertung, imdb_id, poster_url, updated_at)
     )
     fid = cur.lastrowid
@@ -526,7 +528,7 @@ def db_bearbeiten(film_id, titel, jahr, bewertung, genre, laufzeit=None, imdb_be
     updated_at = _now_iso()
     cur.execute(
         """UPDATE filme SET titel=?, jahr=?, bewertung=?, genre=?,
-           laufzeit=?, imdb_bewertung=?, imdb_id=?, poster_url=?, updated_at=?, deleted=0 WHERE id=?""",
+           laufzeit=?, imdb_bewertung=?, imdb_id=?, poster_url=?, updated_at=? WHERE id=?""",
         (titel, jahr, bewertung, genre, laufzeit, imdb_bewertung, imdb_id, poster_url, updated_at, film_id)
     )
     con.commit()
@@ -534,15 +536,12 @@ def db_bearbeiten(film_id, titel, jahr, bewertung, genre, laufzeit=None, imdb_be
     threading.Thread(target=firestore_push_film, args=(film_id,), daemon=True).start()
 
 def db_loeschen(film_id):
-    # Soft-Delete: wir setzen deleted=1 statt die Zeile rauszuwerfen,
-    # damit andere Geräte via Firestore mitbekommen dass der Film weg ist.
     con = sqlite3.connect(DB_FILE)
     cur = con.cursor()
-    updated_at = _now_iso()
-    cur.execute("UPDATE filme SET deleted=1, updated_at=? WHERE id=?", (updated_at, film_id))
+    cur.execute("DELETE FROM filme WHERE id=?", (film_id,))
     con.commit()
     con.close()
-    threading.Thread(target=firestore_push_film, args=(film_id,), daemon=True).start()
+    threading.Thread(target=firestore_delete_film, args=(film_id,), daemon=True).start()
 
 def db_gesehen_toggle(film_id, wert):
     con = sqlite3.connect(DB_FILE)
@@ -551,12 +550,12 @@ def db_gesehen_toggle(film_id, wert):
     if wert == 1:
         zeit = _now_iso()
         cur.execute(
-            "UPDATE filme SET gesehen=?, gesehen_am=?, updated_at=?, deleted=0 WHERE id=?",
+            "UPDATE filme SET gesehen=?, gesehen_am=?, updated_at=? WHERE id=?",
             (1, zeit, updated_at, film_id)
         )
     else:
         cur.execute(
-            "UPDATE filme SET gesehen=?, gesehen_am=NULL, updated_at=?, deleted=0 WHERE id=?",
+            "UPDATE filme SET gesehen=?, gesehen_am=NULL, updated_at=? WHERE id=?",
             (0, updated_at, film_id)
         )
     con.commit()
@@ -568,9 +567,9 @@ def db_titel_existiert(titel: str, ausnahme_id: int | None = None) -> bool:
     con = sqlite3.connect(DB_FILE)
     cur = con.cursor()
     if ausnahme_id is not None:
-        cur.execute("SELECT 1 FROM filme WHERE LOWER(titel)=LOWER(?) AND id != ? AND COALESCE(deleted,0)=0", (titel, ausnahme_id))
+        cur.execute("SELECT 1 FROM filme WHERE LOWER(titel)=LOWER(?) AND id != ?", (titel, ausnahme_id))
     else:
-        cur.execute("SELECT 1 FROM filme WHERE LOWER(titel)=LOWER(?) AND COALESCE(deleted,0)=0", (titel,))
+        cur.execute("SELECT 1 FROM filme WHERE LOWER(titel)=LOWER(?)", (titel,))
     row = cur.fetchone()
     con.close()
     return row is not None
@@ -579,7 +578,7 @@ def db_bewertung_setzen(film_id, bewertung):
     con = sqlite3.connect(DB_FILE)
     cur = con.cursor()
     updated_at = _now_iso()
-    cur.execute("UPDATE filme SET bewertung=?, updated_at=?, deleted=0 WHERE id=?", (bewertung, updated_at, film_id))
+    cur.execute("UPDATE filme SET bewertung=?, updated_at=? WHERE id=?", (bewertung, updated_at, film_id))
     con.commit()
     con.close()
     threading.Thread(target=firestore_push_film, args=(film_id,), daemon=True).start()
@@ -856,8 +855,8 @@ class FilmApp(tk.Tk):
         tree.delete(*tree.get_children())
         for r in rows:
             # Reihenfolge aus _alle_felder(): id, titel, jahr, bewertung, genre, gesehen,
-            # laufzeit, imdb_bewertung, imdb_id, poster_url, gesehen_am, updated_at, deleted
-            fid, titel, jahr, bew, genre, gesehen, laufzeit, imdb_bew, imdb_id, poster_url, gesehen_am, updated_at, deleted = r
+            # laufzeit, imdb_bewertung, imdb_id, poster_url, gesehen_am, updated_at
+            fid, titel, jahr, bew, genre, gesehen, laufzeit, imdb_bew, imdb_id, poster_url, gesehen_am, updated_at = r
 
             self._row_cache[fid] = r
 
@@ -1079,7 +1078,7 @@ class FilmApp(tk.Tk):
         if not row:
             return
 
-        _, titel, jahr, bew, genre, _, laufzeit, imdb_bew, imdb_id, poster_url, _, _, _ = row
+        _, titel, jahr, bew, genre, _, laufzeit, imdb_bew, imdb_id, poster_url, _, _ = row
 
         def save(t, j, b, g, lz, ib, iid, purl):
             db_bearbeiten(fid, t, j, b, g, lz, ib, iid, purl)
