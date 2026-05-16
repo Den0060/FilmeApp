@@ -6,6 +6,7 @@ import random
 import time
 import threading
 import traceback
+import sys
 import requests
 from dotenv import load_dotenv
 import os
@@ -26,12 +27,22 @@ import ctypes
 #  kein Plot, keine Cast-Liste, nichts was wir nicht brauchen.
 # ──────────────────────────────────────────────────────────────
 
-load_dotenv()
+def _base():
+    """Basisordner: im .exe-Modus sys._MEIPASS, sonst Skriptverzeichnis."""
+    return sys._MEIPASS if getattr(sys, 'frozen', False) else os.path.dirname(os.path.abspath(__file__))
+
+load_dotenv(os.path.join(_base(), ".env"))
 OMDB_API_KEY = os.getenv("OMDB_API_KEY")
 IMDB_VERFUEGBAR = bool(OMDB_API_KEY and OMDB_API_KEY != os.getenv("IMDB_VERFUEGBAR"))
 
 # Firestore-Konfiguration – alles optional, läuft auch ohne
-FIREBASE_SERVICE_ACCOUNT_JSON = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON") or os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+# Erst .env prüfen, dann schauen ob die JSON neben der .exe / dem Skript liegt
+_json_pfad = os.path.join(_base(), "filmvault-firestore.json")
+FIREBASE_SERVICE_ACCOUNT_JSON = (
+    os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON")
+    or (os.getenv("GOOGLE_APPLICATION_CREDENTIALS") if os.path.isfile(os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")) else None)
+    or (_json_pfad if os.path.isfile(_json_pfad) else None)
+)
 FIREBASE_VERFUEGBAR = bool(FIREBASE_SERVICE_ACCOUNT_JSON)
 FIRESTORE_COLLECTION = os.getenv("FIRESTORE_COLLECTION", "filme")
 DB_FILE = os.getenv("DB_FILE", "filme.db")
@@ -342,7 +353,7 @@ def firestore_pull_updates(force_full: bool = False) -> bool:
 
     if not docs:
         _set_sync_cursor(_now_iso())
-        return True
+        return False  # Nichts Neues – kein UI-Refresh nötig
 
     newest = last_cursor
     con = _db_connect()
@@ -661,9 +672,26 @@ class FilmApp(tk.Tk):
         self._style()
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        # ── FIX: Hover-Poster verstecken wenn Fenster Fokus verliert ──
+        # z.B. bei Alt-Tab, Klick auf anderen Task, Fenster minimieren
+        self.bind("<FocusOut>", self._on_focus_out)
+        self.bind("<Unmap>",    lambda e: self._hide_hover_poster())
+
         self.aktualisieren()
         # Regelmäßig im Hintergrund auf Remote-Änderungen prüfen
         self.after(SYNC_INTERVAL_MS, self._periodic_remote_sync)
+
+    def _on_focus_out(self, event):
+        """
+        Wird gefeuert wenn irgendetwas innerhalb der App den Fokus verliert.
+        Wir prüfen ob das Fokus-Ziel noch innerhalb unseres Fensters liegt –
+        wenn nicht, Poster verstecken.
+        """
+        # event.widget ist das Widget das den Fokus verloren hat.
+        # focus_get() gibt zurück wer ihn jetzt hat – None = außerhalb der App.
+        if self.focus_get() is None:
+            self._hide_hover_poster()
 
     def _style(self):
         style = ttk.Style(self)
@@ -782,6 +810,9 @@ class FilmApp(tk.Tk):
 
         # Sortierzustand pro Tree merken (welche Spalte, welche Richtung)
         frame._sort_state = {}
+        # ── FIX: aktive Sortierung merken damit _fill_tree sie wiederherstellen kann ──
+        # _aktive_sortierung = (spalten_name, umgekehrt) oder None
+        frame._aktive_sortierung = None
 
         # Buttons rechts daneben, schön untereinander
         action = tk.Frame(body, bg=BG)
@@ -811,16 +842,22 @@ class FilmApp(tk.Tk):
         """
         Sortiert die Tabelle nach der geklickten Spalte.
         Zweiter Klick auf dieselbe Spalte dreht die Richtung um.
+
+        Konvention:
+          absteigend=True  →  ↓  (großer Wert oben)
+          absteigend=False →  ↑  (kleiner Wert oben)
         """
         state = frame._sort_state
-        umgekehrt = state.get(spalte, False)
+        # Beim ersten Klick auf eine Spalte: aufsteigend (False)
+        # Beim zweiten Klick: Richtung umdrehen
+        absteigend = not state.get(spalte, False)
 
         # Alle Zeilen rausziehen, nach Wert sortieren, wieder reinschieben
         zeilen = [(tree.set(iid, spalte), iid) for iid in tree.get_children()]
 
         def sort_key(x):
             wert = x[0]
-            # Leere Werte und "–" ans Ende
+            # Leere Werte und "–" ans Ende (unabhängig von Sortierrichtung)
             if wert in ("", "–", "–min"):
                 return (1, 0, "")
             # Zahlen als Zahlen sortieren nicht als String
@@ -829,15 +866,18 @@ class FilmApp(tk.Tk):
             except Exception:
                 return (0, 0, wert.lower())
 
-        zeilen.sort(key=sort_key, reverse=umgekehrt)
+        zeilen.sort(key=sort_key, reverse=absteigend)
         for idx, (_, iid) in enumerate(zeilen):
             tree.move(iid, "", idx)
 
-        # Richtung für nächsten Klick umdrehen
-        state[spalte] = not umgekehrt
+        # Aktuellen Zustand merken (was gerade angezeigt wird)
+        state[spalte] = absteigend
 
-        # Kleiner Pfeil im Spaltentitel damit man sieht was sortiert ist
-        pfeil = " ↑" if umgekehrt else " ↓"
+        # Aktive Sortierung für _fill_tree speichern – exakt so wie sie jetzt ist
+        frame._aktive_sortierung = (spalte, absteigend)
+
+        # Pfeil zeigt die aktuelle Richtung: ↓ = absteigend, ↑ = aufsteigend
+        pfeil = " ↓" if absteigend else " ↑"
         for col in tree["columns"]:
             txt = tree.heading(col)["text"].rstrip(" ↑↓")
             tree.heading(col, text=txt + (pfeil if col == spalte else ""))
@@ -846,12 +886,21 @@ class FilmApp(tk.Tk):
 
     def aktualisieren(self):
         """Alle drei Tabellen + Glücksrad neu befüllen."""
-        self._fill_tree(self.frame_alle._tree,      db_alle())
-        self._fill_tree(self.frame_watchlist._tree, db_ungesehen())
-        self._fill_tree(self.frame_bewertet._tree,  db_bewertet())
+        self._fill_tree(self.frame_alle._tree,      db_alle(),      self.frame_alle)
+        self._fill_tree(self.frame_watchlist._tree, db_ungesehen(), self.frame_watchlist)
+        self._fill_tree(self.frame_bewertet._tree,  db_bewertet(),  self.frame_bewertet)
         self.frame_rad.lade_filme()
 
-    def _fill_tree(self, tree, rows):
+    def _fill_tree(self, tree, rows, frame=None):
+        # ── FIX: Selektion + Scrollposition merken damit sie nach dem Refresh erhalten bleibt ──
+        sel_vorher = tree.selection()
+        # Erste sichtbare Zeile für späteres Scroll-Restore
+        sichtbare = tree.get_children()
+        erste_sichtbare_iid = None
+        if sichtbare:
+            # identify_row bei y=1 gibt die oberste sichtbare Zeile
+            erste_sichtbare_iid = tree.identify_row(1) or None
+
         tree.delete(*tree.get_children())
         for r in rows:
             # Reihenfolge aus _alle_felder(): id, titel, jahr, bewertung, genre, gesehen,
@@ -874,6 +923,38 @@ class FilmApp(tk.Tk):
 
         tree.tag_configure("gesehen", foreground=MUTED)
         tree.tag_configure("offen",   foreground=TEXT)
+
+        # Sortierzustand wiederherstellen wenn eine Spalte aktiv war
+        if frame is not None and frame._aktive_sortierung is not None:
+            spalte, absteigend = frame._aktive_sortierung
+
+            zeilen = [(tree.set(iid, spalte), iid) for iid in tree.get_children()]
+
+            def sort_key(x):
+                wert = x[0]
+                if wert in ("", "–", "–min"):
+                    return (1, 0, "")
+                try:
+                    return (0, float(wert.replace(" min", "").replace(",", ".")), "")
+                except Exception:
+                    return (0, 0, wert.lower())
+
+            zeilen.sort(key=sort_key, reverse=absteigend)
+            for idx, (_, iid) in enumerate(zeilen):
+                tree.move(iid, "", idx)
+
+            # Pfeil: ↓ = absteigend, ↑ = aufsteigend
+            pfeil = " ↓" if absteigend else " ↑"
+            for col in tree["columns"]:
+                txt = tree.heading(col)["text"].rstrip(" ↑↓")
+                tree.heading(col, text=txt + (pfeil if col == spalte else ""))
+
+        # Selektion wiederherstellen wenn der Film noch da ist
+        for iid in sel_vorher:
+            if tree.exists(iid):
+                tree.selection_set(iid)
+                tree.see(iid)
+                break
 
     def _hover_im_tree(self, event, tree):
         iid = tree.identify_row(event.y)
