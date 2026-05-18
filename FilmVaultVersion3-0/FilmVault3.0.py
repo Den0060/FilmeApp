@@ -7,6 +7,7 @@ import time
 import threading
 import traceback
 import sys
+import socket
 import requests
 from dotenv import load_dotenv
 import os
@@ -47,6 +48,31 @@ FIREBASE_VERFUEGBAR = bool(FIREBASE_SERVICE_ACCOUNT_JSON)
 FIRESTORE_COLLECTION = os.getenv("FIRESTORE_COLLECTION", "filme")
 DB_FILE = os.getenv("DB_FILE", "filme.db")
 SYNC_INTERVAL_MS = int(os.getenv("SYNC_INTERVAL_MS", "30000"))  # alle 30s auf Updates prüfen
+
+# ──────────────────────────────────────────────────────────────
+#  ONLINE-PRÜFUNG (ohne externe Verbindung)
+#  Wir fragen nur den lokalen DNS-Resolver ob er "dns.msftncsi.com"
+#  kennt – das ist Microsofts eigener NCSI-Host den Windows sowieso
+#  ständig nutzt. Es wird keine Verbindung aufgebaut, keine IP
+#  nach außen gesendet – nur ein lokaler getaddrinfo-Aufruf.
+#  Schlägt das fehl, sind wir offline.
+# ──────────────────────────────────────────────────────────────
+
+def _internet_verfuegbar() -> bool:
+    """
+    Prüft Internetverbindung rein lokal über den DNS-Resolver –
+    kein TCP-Connect, keine Daten nach außen.
+    """
+    try:
+        socket.setdefaulttimeout(3)
+        socket.getaddrinfo("dns.msftncsi.com", None)
+        return True
+    except Exception:
+        return False
+
+# Beim Start einmalig prüfen
+OFFLINE = not _internet_verfuegbar()
+
 
 def imdb_suche(titel: str) -> list[dict]:
     """
@@ -611,6 +637,8 @@ SUCCESS = "#2ecc71"
 WARNING = "#f39c12"
 BORDER  = "#2a2a3e"
 GOLD    = "#f5c518"   # IMDb-typisches Gelb für den IMDb-Button
+OFFLINE_BG = "#2a1800"   # Dunkles Orange für Offline-Banner
+OFFLINE_FG = "#ffb347"
 
 WHEEL_COLORS = [
     "#e94560", "#0f3460", "#533483", "#e94560",
@@ -651,13 +679,15 @@ class FilmApp(tk.Tk):
         super().__init__()
         db_init()
 
-        # Beim Start einmalig von Firestore holen – nur wenn lokal noch nichts da ist
-        # machen wir einen Full-Pull, sonst nur die Änderungen seit letztem Mal
-        try:
-            leer = len(db_alle()) == 0
-            firestore_pull_updates(force_full=leer)
-        except Exception:
-            traceback.print_exc()
+        self._offline = OFFLINE
+
+        # Beim Start einmalig von Firestore holen – nur wenn online
+        if not self._offline:
+            try:
+                leer = len(db_alle()) == 0
+                firestore_pull_updates(force_full=leer)
+            except Exception:
+                traceback.print_exc()
 
         self.title("🎬 FilmVault")
         self.geometry("1300x740")
@@ -679,8 +709,55 @@ class FilmApp(tk.Tk):
         self.bind("<Unmap>",    lambda e: self._hide_hover_poster())
 
         self.aktualisieren()
+        self._update_offline_banner()
+
         # Regelmäßig im Hintergrund auf Remote-Änderungen prüfen
         self.after(SYNC_INTERVAL_MS, self._periodic_remote_sync)
+        # Nach Start das erste Mal nach 15s Verbindungsstatus neu prüfen
+        self.after(15000, self._periodic_online_check)
+
+    # ── Offline-Handling ───────────────────────────────────
+
+    def _periodic_online_check(self):
+        """Prüft alle 5 Min. ob sich der Online-Status geändert hat."""
+        def check():
+            war_offline = self._offline
+            self._offline = not _internet_verfuegbar()
+            if war_offline != self._offline:
+                self.after(0, self._update_offline_banner)
+        threading.Thread(target=check, daemon=True).start()
+        self.after(300000, self._periodic_online_check)
+
+    def _update_offline_banner(self):
+        """Zeigt/versteckt den Offline-Banner und sperrt/entsperrt Schreib-Buttons."""
+        if self._offline:
+            self._offline_banner.pack(fill="x", before=self.main)
+        else:
+            self._offline_banner.pack_forget()
+        self._set_aktionen_gesperrt(self._offline)
+
+    def _set_aktionen_gesperrt(self, gesperrt: bool):
+        """Alle Schreib-Buttons deaktivieren wenn offline."""
+        zustand = "disabled" if gesperrt else "normal"
+        for frame in [self.frame_alle, self.frame_watchlist, self.frame_bewertet]:
+            if hasattr(frame, "_aktions_buttons"):
+                for btn in frame._aktions_buttons:
+                    btn.configure(state=zustand)
+            if hasattr(frame, "_hinzufuegen_btn"):
+                frame._hinzufuegen_btn.configure(state=zustand)
+
+    def _offline_geblockt(self) -> bool:
+        """Gibt True zurück und zeigt Meldung wenn offline. Doppelsicherung."""
+        if self._offline:
+            messagebox.showwarning(
+                "Kein Internet",
+                "Du bist offline.\n\nDu kannst deine Filme ansehen, "
+                "aber keine Änderungen speichern.",
+            )
+            return True
+        return False
+
+    # ── FocusOut / Hover ───────────────────────────────────
 
     def _on_focus_out(self, event):
         """
@@ -741,11 +818,25 @@ class FilmApp(tk.Tk):
         # Dünne Trennlinie zwischen Sidebar und Inhalt
         tk.Frame(self, bg=BORDER, width=1).pack(side="left", fill="y")
 
-        # Der eigentliche Hauptbereich rechts
-        self.main = tk.Frame(self, bg=BG)
-        self.main.pack(side="left", fill="both", expand=True)
+        # Rechter Bereich: Banner + Inhalt gestapelt
+        rechts = tk.Frame(self, bg=BG)
+        rechts.pack(side="left", fill="both", expand=True)
 
-        # Alle Ansichten übereinander legen, dann per lift() nach vorne holen
+        # ── Offline-Banner (zunächst unsichtbar) ────────────
+        self._offline_banner = tk.Frame(rechts, bg=OFFLINE_BG, pady=7)
+        # wird nur bei _update_offline_banner() eingeblendet
+
+        tk.Label(
+            self._offline_banner,
+            text="⚠   Kein Internet – Nur-Lesen-Modus. Änderungen können nicht gespeichert werden.",
+            bg=OFFLINE_BG, fg=OFFLINE_FG,
+            font=("Segoe UI", 10, "bold"),
+        ).pack()
+
+        # Hauptinhalt
+        self.main = tk.Frame(rechts, bg=BG)
+        self.main.pack(side="top", fill="both", expand=True)
+
         self.frame_alle      = self._frame_filme("Alle Filme")
         self.frame_watchlist = self._frame_filme("Watchlist – noch nicht gesehen")
         self.frame_bewertet  = self._frame_filme("Bewertet – meine Ratings")
@@ -772,10 +863,16 @@ class FilmApp(tk.Tk):
         header.pack(fill="x")
         tk.Label(header, text=titel, font=("Segoe UI", 18, "bold"),
                  bg=BG, fg=TEXT).pack(side="left")
-        tk.Button(header, text="+ Film hinzufügen", bg=ACCENT, fg="#fff",
-                  font=("Segoe UI", 10, "bold"), bd=0, padx=16, pady=8,
-                  cursor="hand2", activebackground="#c73652",
-                  command=self.film_hinzufuegen_dialog).pack(side="right")
+
+        # Referenz merken damit wir ihn offline deaktivieren können
+        hinzufuegen_btn = tk.Button(
+            header, text="+ Film hinzufügen", bg=ACCENT, fg="#fff",
+            font=("Segoe UI", 10, "bold"), bd=0, padx=16, pady=8,
+            cursor="hand2", activebackground="#c73652",
+            command=self.film_hinzufuegen_dialog,
+        )
+        hinzufuegen_btn.pack(side="right")
+        frame._hinzufuegen_btn = hinzufuegen_btn
 
         tk.Frame(frame, bg=BORDER, height=1).pack(fill="x", padx=24)
 
@@ -818,20 +915,27 @@ class FilmApp(tk.Tk):
         action = tk.Frame(body, bg=BG)
         action.pack(side="left", fill="y", padx=(10, 0))
 
-        def btn(parent, text, bg, fg, cmd):
-            return tk.Button(parent, text=text, bg=bg, fg=fg,
+        def mkbtn(text, bg, fg, cmd):
+            return tk.Button(action, text=text, bg=bg, fg=fg,
                              font=("Segoe UI", 9, "bold"), bd=0,
                              padx=10, pady=8, width=13,
                              cursor="hand2", activebackground=bg,
                              activeforeground=fg, anchor="w",
                              command=cmd)
 
-        btn(action, "✅  Gesehen",    SUCCESS,   "#fff", lambda: self.toggle_gesehen(tree, 1)).pack(fill="x", pady=(0, 4))
-        btn(action, "🔄  Ungesehen",  WARNING,   "#fff", lambda: self.toggle_gesehen(tree, 0)).pack(fill="x", pady=(0, 4))
-        btn(action, "✏  Bearbeiten", ACCENT2,    "#fff", lambda: self.film_bearbeiten_dialog(tree)).pack(fill="x", pady=(0, 4))
-        btn(action, "🗑  Löschen",    "#3a1a2e", ACCENT, lambda: self.film_loeschen(tree)).pack(fill="x")
+        b_gesehen   = mkbtn("✅  Gesehen",    SUCCESS,   "#fff", lambda: self.toggle_gesehen(tree, 1))
+        b_ungesehen = mkbtn("🔄  Ungesehen",  WARNING,   "#fff", lambda: self.toggle_gesehen(tree, 0))
+        b_bearb     = mkbtn("✏  Bearbeiten", ACCENT2,   "#fff", lambda: self.film_bearbeiten_dialog(tree))
+        b_loeschen  = mkbtn("🗑  Löschen",    "#3a1a2e", ACCENT, lambda: self.film_loeschen(tree))
 
-        # Hover-Poster
+        b_gesehen.pack(fill="x", pady=(0, 4))
+        b_ungesehen.pack(fill="x", pady=(0, 4))
+        b_bearb.pack(fill="x", pady=(0, 4))
+        b_loeschen.pack(fill="x")
+
+        # Referenz für offline-Sperrung
+        frame._aktions_buttons = [b_gesehen, b_ungesehen, b_bearb, b_loeschen]
+
         tree.bind("<Motion>", lambda e, tr=tree: self._hover_im_tree(e, tr))
         tree.bind("<Leave>", lambda e: self._hide_hover_poster())
 
@@ -991,8 +1095,8 @@ class FilmApp(tk.Tk):
             self._show_hover_poster(event.x_root, event.y_root, self._hover_cache[imdb_id], imdb_id)
             return
 
-        # Noch gar nicht da – im Hintergrund nachladen
-        if imdb_id:
+        # Nur nachladen wenn online
+        if imdb_id and not self._offline:
             threading.Thread(target=self._hover_fetch_poster,
                              args=(imdb_id, event.x_root, event.y_root),
                              daemon=True).start()
@@ -1073,7 +1177,7 @@ class FilmApp(tk.Tk):
     def _periodic_remote_sync(self):
         """Prüft alle SYNC_INTERVAL_MS ob es Remote-Änderungen gibt."""
         def worker():
-            if firestore_pull_updates(force_full=False):
+            if not self._offline and firestore_pull_updates(force_full=False):
                 self.after(0, self.aktualisieren)
         threading.Thread(target=worker, daemon=True).start()
         self.after(SYNC_INTERVAL_MS, self._periodic_remote_sync)
@@ -1100,6 +1204,8 @@ class FilmApp(tk.Tk):
     # ── Aktionen ───────────────────────────────────────────
 
     def toggle_gesehen(self, tree, wert):
+        if self._offline_geblockt():
+            return
         sel = tree.selection()
         if not sel:
             messagebox.showinfo("Hinweis", "Erstmal einen Film auswählen!")
@@ -1131,6 +1237,8 @@ class FilmApp(tk.Tk):
         self.aktualisieren()
 
     def film_loeschen(self, tree):
+        if self._offline_geblockt():
+            return
         sel = tree.selection()
         if not sel:
             messagebox.showinfo("Hinweis", "Erstmal einen Film auswählen!")
@@ -1141,6 +1249,8 @@ class FilmApp(tk.Tk):
             self.aktualisieren()
 
     def film_hinzufuegen_dialog(self):
+        if self._offline_geblockt():
+            return
         FilmDialog(self, titel="Film hinzufügen", callback=self._film_speichern)
 
     def _film_speichern(self, titel, jahr, bewertung, genre, laufzeit, imdb_bewertung, imdb_id, poster_url):
@@ -1148,6 +1258,8 @@ class FilmApp(tk.Tk):
         self.aktualisieren()
 
     def film_bearbeiten_dialog(self, tree):
+        if self._offline_geblockt():
+            return
         sel = tree.selection()
         if not sel:
             messagebox.showinfo("Hinweis", "Erstmal einen Film auswählen!")
