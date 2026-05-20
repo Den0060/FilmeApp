@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 import os
 from datetime import datetime, timezone
 import ctypes
+import queue
 
 # ──────────────────────────────────────────────────────────────
 #  IMDb via OMDb
@@ -222,6 +223,32 @@ def _now_iso() -> str:
 _firestore_client = None
 _firestore_init_failed = False
 SYNC_CURSOR_KEY = "last_remote_sync"
+
+# Alle Firestore-Schreiboperationen laufen über diese Queue –
+# so gibt's immer nur einen einzigen Worker-Thread statt beliebig vieler.
+# Das verhindert gleichzeitige SQLite-Zugriffe aus verschiedenen Threads.
+_push_queue: queue.Queue = queue.Queue()
+
+
+def _firestore_worker():
+    """
+    Läuft als einzelner Daemon-Thread und arbeitet die Push-Queue ab.
+    Kein wildes Thread-Spawning mehr bei jeder DB-Änderung.
+    """
+    while True:
+        item = _push_queue.get()
+        if item is None:
+            break
+        action, arg = item
+        try:
+            if action == "push":
+                firestore_push_film(arg)
+            elif action == "delete":
+                firestore_delete_film(arg)
+        except Exception:
+            traceback.print_exc()
+        finally:
+            _push_queue.task_done()
 
 
 def _get_firestore_client():
@@ -455,6 +482,14 @@ def db_init():
     # direkt wieder zumachen.
     con = sqlite3.connect(DB_FILE)
     cur = con.cursor()
+
+    # WAL-Modus erlaubt gleichzeitige Reads während ein Write läuft –
+    # das verhindert "database is locked"-Fehler wenn der Sync-Thread
+    # gerade schreibt während wir aus dem Hauptthread lesen.
+    cur.execute("PRAGMA journal_mode=WAL")
+    # 3 Sekunden warten bevor SQLite aufgibt – statt sofort zu crashen.
+    cur.execute("PRAGMA busy_timeout=3000")
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS filme (
             id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -500,6 +535,10 @@ def db_init():
 
     con.commit()
     con.close()
+
+    # Den einzigen Firestore-Worker-Thread starten – läuft die ganze
+    # Laufzeit durch und arbeitet Schreibjobs aus der Queue ab.
+    threading.Thread(target=_firestore_worker, daemon=True).start()
 
 def _alle_felder():
     return "id, titel, jahr, bewertung, genre, gesehen, laufzeit, imdb_bewertung, imdb_id, poster_url, gesehen_am, updated_at"
@@ -556,8 +595,8 @@ def db_hinzufuegen(titel, jahr, bewertung, genre, laufzeit=None, imdb_bewertung=
     fid = cur.lastrowid
     con.commit()
     con.close()
-    # Im Hintergrund zu Firestore pushen – Hauptthread blockiert nicht
-    threading.Thread(target=firestore_push_film, args=(fid,), daemon=True).start()
+    # Firestore-Push über die Queue – kein neuer Thread pro Speichervorgang
+    _push_queue.put(("push", fid))
 
 def db_bearbeiten(film_id, titel, jahr, bewertung, genre, laufzeit=None, imdb_bewertung=None, imdb_id=None, poster_url=None):
     con = sqlite3.connect(DB_FILE)
@@ -570,7 +609,7 @@ def db_bearbeiten(film_id, titel, jahr, bewertung, genre, laufzeit=None, imdb_be
     )
     con.commit()
     con.close()
-    threading.Thread(target=firestore_push_film, args=(film_id,), daemon=True).start()
+    _push_queue.put(("push", film_id))
 
 def db_loeschen(film_id):
     con = sqlite3.connect(DB_FILE)
@@ -578,7 +617,7 @@ def db_loeschen(film_id):
     cur.execute("DELETE FROM filme WHERE id=?", (film_id,))
     con.commit()
     con.close()
-    threading.Thread(target=firestore_delete_film, args=(film_id,), daemon=True).start()
+    _push_queue.put(("delete", film_id))
 
 def db_gesehen_toggle(film_id, wert):
     con = sqlite3.connect(DB_FILE)
@@ -597,7 +636,7 @@ def db_gesehen_toggle(film_id, wert):
         )
     con.commit()
     con.close()
-    threading.Thread(target=firestore_push_film, args=(film_id,), daemon=True).start()
+    _push_queue.put(("push", film_id))
 
 def db_titel_existiert(titel: str, ausnahme_id: int | None = None) -> bool:
     # Funktion um in der Datenbank auf Duplikate zu prüfen
@@ -618,7 +657,7 @@ def db_bewertung_setzen(film_id, bewertung):
     cur.execute("UPDATE filme SET bewertung=?, updated_at=? WHERE id=?", (bewertung, updated_at, film_id))
     con.commit()
     con.close()
-    threading.Thread(target=firestore_push_film, args=(film_id,), daemon=True).start()
+    _push_queue.put(("push", film_id))
 
 # ──────────────────────────────────────────────────────────────
 #  FARBEN & DESIGN
@@ -996,7 +1035,7 @@ class FilmApp(tk.Tk):
         self.frame_rad.lade_filme()
 
     def _fill_tree(self, tree, rows, frame=None):
-        # ── FIX: Selektion + Scrollposition merken damit sie nach dem Refresh erhalten bleibt ──
+        # Selektion + Scrollposition merken damit sie nach dem Refresh erhalten bleibt
         sel_vorher = tree.selection()
         # Erste sichtbare Zeile für späteres Scroll-Restore
         sichtbare = tree.get_children()
@@ -1004,6 +1043,11 @@ class FilmApp(tk.Tk):
         if sichtbare:
             # identify_row bei y=1 gibt die oberste sichtbare Zeile
             erste_sichtbare_iid = tree.identify_row(1) or None
+
+        # Während wir die Tabelle neu aufbauen kurz alle Bindings aushängen –
+        # sonst feuert TreeviewSelect mitten im Delete/Insert und triggert
+        # ungewollt Callbacks im Hauptthread.
+        tree.unbind("<<TreeviewSelect>>")
 
         tree.delete(*tree.get_children())
         for r in rows:
@@ -1100,6 +1144,8 @@ class FilmApp(tk.Tk):
             threading.Thread(target=self._hover_fetch_poster,
                              args=(imdb_id, event.x_root, event.y_root),
                              daemon=True).start()
+
+        self._hide_hover_poster()
 
     def _hover_fetch_poster(self, imdb_id, x, y):
         details = imdb_details(imdb_id)
