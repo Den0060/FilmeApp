@@ -738,6 +738,10 @@ class FilmApp(tk.Tk):
         self._hover_iid = None
         self._hover_cache = {}
         self._poster_image_cache = {}
+        # Debounce-Timer für Hover – verhindert Thread-Spam bei schneller Mausbewegung
+        self._hover_after_id = None
+        # Jeder Fetch bekommt einen aufsteigenden Token; nur der aktuellste darf anzeigen
+        self._hover_request_token = 0
         self._style()
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -1107,7 +1111,7 @@ class FilmApp(tk.Tk):
     def _hover_im_tree(self, event, tree):
         iid = tree.identify_row(event.y)
 
-        col = tree.identify_column(event.x) # nur für Titel anzeigen, wenn darauf gehovert wird
+        col = tree.identify_column(event.x)  # nur für Titel anzeigen, wenn darauf gehovert wird
         if col != "#1":
             self._hide_hover_poster()
             return
@@ -1121,6 +1125,21 @@ class FilmApp(tk.Tk):
             return
 
         self._hover_iid = iid
+
+        # Noch laufenden Debounce-Timer canceln bevor wir einen neuen starten –
+        # so wird bei schneller Mausbewegung nur der letzte iid verarbeitet
+        if self._hover_after_id is not None:
+            self.after_cancel(self._hover_after_id)
+        self._hover_after_id = self.after(150, lambda i=iid: self._hover_delayed(i))
+
+    def _hover_delayed(self, iid):
+        """Wird 150 ms nach der letzten Mausbewegung aufgerufen – dann erst echte Arbeit."""
+        self._hover_after_id = None
+
+        # iid könnte inzwischen schon wieder veraltet sein (Maus weitergewandert)
+        if self._hover_iid != iid:
+            return
+
         row = self._row_cache.get(int(iid))
         if not row:
             self._hide_hover_poster()
@@ -1131,33 +1150,49 @@ class FilmApp(tk.Tk):
 
         # Poster-URL schon in der DB gespeichert – direkt anzeigen
         if poster_url:
-            self._show_hover_poster(event.x_root, event.y_root, poster_url, imdb_id)
+            self._show_hover_poster(poster_url, imdb_id)
             return
 
         # Schon mal von IMDb geholt – aus dem RAM-Cache nehmen
         if imdb_id and imdb_id in self._hover_cache:
-            self._show_hover_poster(event.x_root, event.y_root, self._hover_cache[imdb_id], imdb_id)
+            self._show_hover_poster(self._hover_cache[imdb_id], imdb_id)
             return
 
-        # Nur nachladen wenn online
+        # Nur nachladen wenn online; Token hochzählen – der Thread prüft
+        # am Ende ob er noch aktuell ist und verwirft sich sonst stillschweigend
         if imdb_id and not self._offline:
-            threading.Thread(target=self._hover_fetch_poster,
-                             args=(imdb_id, event.x_root, event.y_root),
-                             daemon=True).start()
+            self._hover_request_token += 1
+            token = self._hover_request_token
+            threading.Thread(
+                target=self._hover_fetch_poster,
+                args=(imdb_id, token),
+                daemon=True
+            ).start()
 
-        self._hide_hover_poster()
-
-    def _hover_fetch_poster(self, imdb_id, x, y):
+    def _hover_fetch_poster(self, imdb_id, token):
         details = imdb_details(imdb_id)
         poster_url = details.get("poster_url") if details else None
         if poster_url:
             self._hover_cache[imdb_id] = poster_url
-        self.after(0, lambda: self._show_hover_poster(x, y, poster_url, imdb_id))
+        # Nur anzeigen wenn dieser Request noch der aktuellste ist –
+        # zwischenzeitlich gestartete Fetches werden so stillschweigend verworfen
+        if token == self._hover_request_token:
+            self.after(0, lambda: self._show_hover_poster(poster_url, imdb_id))
 
-    def _show_hover_poster(self, x, y, poster_url, imdb_id=None):
+    def _show_hover_poster(self, poster_url, imdb_id=None):
         if not poster_url:
             return
         self._hide_hover_poster()
+
+        # Aktuelle Mausposition direkt vom OS holen – so stimmt die Position
+        # auch wenn zwischen Debounce/Fetch-Ende und Anzeige Zeit vergangen ist
+        mx, my = self.winfo_pointerxy()
+
+        # Popup rechts neben dem Cursor, aber innerhalb des Bildschirms bleiben
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        px = mx + 18 if mx + 18 + 260 < sw else mx - 278
+        py = my + 18 if my + 18 + 390 < sh else sh - 408
 
         # Bild schon als PhotoImage im Cache – direkt Popup aufmachen
         if imdb_id and imdb_id in self._poster_image_cache:
@@ -1165,7 +1200,7 @@ class FilmApp(tk.Tk):
             popup.overrideredirect(True)
             popup.attributes("-topmost", True)
             popup.configure(bg=CARD)
-            popup.geometry(f"+{x+18}+{y+18}")
+            popup.geometry(f"+{px}+{py}")
             self._hover_popup = popup
             lbl = tk.Label(popup, bg=CARD, bd=1, relief="solid", image=self._poster_image_cache[imdb_id])
             lbl.pack()
@@ -1177,7 +1212,7 @@ class FilmApp(tk.Tk):
         popup.overrideredirect(True)
         popup.attributes("-topmost", True)
         popup.configure(bg=CARD)
-        popup.geometry(f"+{x+18}+{y+18}")
+        popup.geometry(f"+{px}+{py}")
         self._hover_popup = popup
 
         lbl = tk.Label(popup, bg=CARD, bd=1, relief="solid")
@@ -1212,6 +1247,10 @@ class FilmApp(tk.Tk):
 
     def _hide_hover_poster(self):
         self._hover_iid = None
+        # Noch ausstehenden Debounce-Timer canceln damit kein veralteter Fetch startet
+        if self._hover_after_id is not None:
+            self.after_cancel(self._hover_after_id)
+            self._hover_after_id = None
         if self._hover_popup is not None:
             try:
                 self._hover_popup.destroy()
@@ -1937,14 +1976,15 @@ class GluecksradFrame(tk.Frame):
                                 bg=PANEL, fg=TEXT, selectcolor=ACCENT2,
                                 activebackground=PANEL, activeforeground=TEXT,
                                 font=("Segoe UI", 10), anchor="w", cursor="hand2",
-                                command=self._zeichne_rad)
+                                command=self._zeichne_rad_wenn_idle)
             cb.pack(side="left", fill="x", expand=True)
 
+            # Kein Redraw während die Animation läuft – tick() übernimmt das sowieso
             sp = tk.Spinbox(zeile, from_=1, to=5, width=2,
                             textvariable=self.counts[i],
                             bg="#0d0d14", fg=TEXT, buttonbackground=BORDER,
                             highlightthickness=0, bd=0, font=("Segoe UI", 9),
-                            command=self._zeichne_rad)
+                            command=self._zeichne_rad_wenn_idle)
             sp.pack(side="right")
 
         self._zeichne_rad()
@@ -1965,6 +2005,11 @@ class GluecksradFrame(tk.Frame):
                 anzahl = max(1, min(5, self.counts[i].get()))
                 result.extend([self.filme[i][1]] * anzahl)
         return result
+
+    def _zeichne_rad_wenn_idle(self):
+        # Kein Redraw während die Animation läuft – tick() übernimmt das sowieso
+        if not self.spinning:
+            self._zeichne_rad(self.angle)
 
     def _zeichne_rad(self, winkel_offset=0):
         """Rad komplett neu zeichnen – wird bei jedem Animations-Frame aufgerufen."""
