@@ -415,6 +415,9 @@ def firestore_pull_updates(force_full: bool = False) -> bool:
     con = _db_connect()
     cur = con.cursor()
     try:
+        # Alle Remote-IDs sammeln damit wir am Ende wissen was weggefallen ist
+        remote_ids = set()
+
         for doc in docs:
             data = doc.to_dict() or {}
             updated_at = data.get("updated_at") or last_cursor
@@ -426,6 +429,8 @@ def firestore_pull_updates(force_full: bool = False) -> bool:
                 fid = _parse_int(doc.id)
             if fid is None:
                 continue
+
+            remote_ids.add(fid)
 
             cur.execute("""
                 INSERT INTO filme
@@ -460,9 +465,19 @@ def firestore_pull_updates(force_full: bool = False) -> bool:
                 updated_at,
             ))
 
+        # Beim Vollsync lokal vorhandene IDs die in Firestore nicht mehr existieren
+        # löschen – läuft auch wenn docs leer war (z.B. Firestore komplett leer)
+        if force_full:
+            cur.execute("SELECT id FROM filme")
+            lokale_ids = {row[0] for row in cur.fetchall()}
+            verwaist = lokale_ids - remote_ids  # remote_ids ist leer wenn Firestore leer
+            for fid in verwaist:
+                cur.execute("DELETE FROM filme WHERE id=?", (fid,))
+
         con.commit()
-        _set_sync_cursor(newest)
-        return True
+        _set_sync_cursor(newest if docs else _now_iso())
+        # True zurückgeben wenn sich wirklich was geändert hat
+        return bool(docs) or bool(verwaist) if force_full else bool(docs)
     except Exception:
         con.rollback()
         print("Fehler beim Einlesen der Firestore-Daten:")
@@ -539,9 +554,10 @@ def db_init():
     con.commit()
     con.close()
 
-    # Den einzigen Firestore-Worker-Thread starten – läuft die ganze
-    # Laufzeit durch und arbeitet Schreibjobs aus der Queue ab.
-    threading.Thread(target=_firestore_worker, daemon=True).start()
+    # Den Firestore-Worker nur starten wenn Firebase überhaupt konfiguriert ist –
+    # im Lokalmodus bleibt die Queue leer und kein Thread wird gebraucht.
+    if FIREBASE_VERFUEGBAR:
+        threading.Thread(target=_firestore_worker, daemon=True).start()
 
 def _alle_felder():
     return "id, titel, jahr, bewertung, genre, gesehen, laufzeit, imdb_bewertung, imdb_id, poster_url, gesehen_am, updated_at"
@@ -793,11 +809,11 @@ class FilmApp(tk.Tk):
 
         self._offline = OFFLINE
 
-        # Beim Start einmalig von Firestore holen – nur wenn Firebase konfiguriert ist
+        # Beim Start immer Vollsync – so werden auch remote hart gelöschte Dokumente
+        # lokal entfernt, weil der ID-Abgleich (verwaist) bei force_full=True läuft
         if FIREBASE_VERFUEGBAR and not self._offline:
             try:
-                leer = len(db_alle()) == 0
-                firestore_pull_updates(force_full=leer)
+                firestore_pull_updates(force_full=True)
             except Exception:
                 traceback.print_exc()
 
