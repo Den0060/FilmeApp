@@ -5,6 +5,7 @@ import threading
 import traceback
 import tkinter as tk
 from tkinter import ttk, messagebox
+from datetime import datetime
 
 import requests
 
@@ -233,6 +234,7 @@ class FilmApp(tk.Tk):
         # Jeder Fetch bekommt einen aufsteigenden Token; nur der aktuellste darf anzeigen
         self._hover_request_token = 0
         self._sync_running = False
+        self._sync_status_text = "Sync: offline" if self._offline else "Sync: bereit"
         self._style()
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -293,6 +295,7 @@ class FilmApp(tk.Tk):
                     self._scope = dict(CURRENT_SCOPE)
                     db_init()
                     self._offline = False
+                    self.after(0, lambda: self._set_sync_status("Sync prüft..."))
 
                     try:
                         sync_geaendert = firestore_pull_updates(force_full=not _db_hat_filme(DB_FILE))
@@ -301,6 +304,7 @@ class FilmApp(tk.Tk):
                         # selbst ist noch nicht erreichbar. Dann weiter gesperrt lassen.
                         print(f"Cloud-Reconnect noch nicht möglich: {exc}")
                         self._offline = True
+                        self.after(0, lambda: self._set_sync_status("Sync: offline"))
                 else:
                     # Internet ist da, aber die Firebase-Session konnte nicht
                     # erneuert werden. Dann lieber weiterhin nur lesend bleiben.
@@ -679,13 +683,29 @@ class FilmApp(tk.Tk):
         self._hover_request_token = 0
         self._hide_hover_poster()
 
+    def _sync_status_label(self):
+        """Text für die obere Statuszeile."""
+        if self._scope.get("mode") == "local":
+            return "Sync aus"
+
+        if self._offline:
+            return "Sync: offline"
+
+        return self._sync_status_text or "Sync: bereit"
+
+    def _set_sync_status(self, text: str):
+        """Aktualisiert den Sync-Text in der oberen Statuszeile."""
+        self._sync_status_text = text
+        if hasattr(self, "_status_var"):
+            self._refresh_scope_ui()
+
     def _refresh_scope_ui(self):
         if self._scope.get("mode") == "user":
             self.scope_title_lbl.configure(text="☁ Persönlich")
             ver = "verifiziert" if self._scope.get("email_verified") else "nicht verifiziert"
             self.scope_detail_lbl.configure(text=f"{self._scope.get('email') or 'ohne Mail'}\n{ver}")
             self.scope_status_lbl.configure(text=f"Persönlicher Cloudbereich\nDB: {os.path.basename(DB_FILE)}")
-            self._status_var.set(f"Persönlicher Cloudbereich · {self._scope.get('email') or 'angemeldet'} · {'offline' if self._offline else 'online'}")
+            self._status_var.set(f"Persönlicher Cloudbereich · {self._scope.get('email') or 'angemeldet'} · {self._sync_status_label()}")
             self.btn_scope_local.configure(state="normal")
             self.btn_scope_group.configure(text="🔄 Cloud wechseln", state="normal")
             self.btn_scope_logout.configure(state="normal")
@@ -695,7 +715,7 @@ class FilmApp(tk.Tk):
             code = self._scope.get("group_code") or "kein Code gespeichert"
             self.scope_detail_lbl.configure(text=f"{self._scope.get('email') or 'ohne Mail'}\n{ver}\nCode: {code}")
             self.scope_status_lbl.configure(text=f"Gruppenbereich\nDB: {os.path.basename(DB_FILE)}")
-            self._status_var.set(f"Gruppe · {self._scope.get('group_name') or 'Gruppe'} · {'offline' if self._offline else 'online'}")
+            self._status_var.set(f"Gruppe · {self._scope.get('group_name') or 'Gruppe'} · {self._sync_status_label()}")
             self.btn_scope_local.configure(state="normal")
             self.btn_scope_group.configure(text="🔄 Cloud wechseln", state="normal")
             self.btn_scope_logout.configure(state="normal")
@@ -1092,6 +1112,7 @@ class FilmApp(tk.Tk):
             return
 
         scope_snapshot = dict(self._scope)
+        self._set_sync_status("Sync läuft...")
 
         def same_scope_as_start() -> bool:
             return (
@@ -1107,9 +1128,15 @@ class FilmApp(tk.Tk):
                 if self._offline:
                     return
 
-                if firestore_pull_updates(force_full=False):
-                    if same_scope_as_start():
+                geaendert = firestore_pull_updates(force_full=False)
+
+                if same_scope_as_start():
+                    zeit = datetime.now().strftime("%H:%M")
+                    if geaendert:
                         self.after(0, self.aktualisieren)
+                        self.after(0, lambda: self._set_sync_status(f"Sync: aktualisiert {zeit}"))
+                    else:
+                        self.after(0, lambda: self._set_sync_status(f"Sync: aktuell {zeit}"))
 
             except Exception as exc:
                 # Wenn die App online gestartet ist und danach Internet weg ist,
@@ -1118,6 +1145,7 @@ class FilmApp(tk.Tk):
                 print(f"Cloud-Sync nicht erreichbar: {exc}")
                 if same_scope_as_start() and self._scope.get("mode") in ("group", "user"):
                     self._offline = True
+                    self.after(0, lambda: self._set_sync_status("Sync: offline"))
                     self.after(0, self._update_offline_banner)
                     self.after(0, self._refresh_scope_ui)
 
