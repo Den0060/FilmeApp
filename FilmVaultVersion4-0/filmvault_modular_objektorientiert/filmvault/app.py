@@ -1,10 +1,11 @@
 import io
+import json
 import os
 import sqlite3
 import threading
 import traceback
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 from datetime import datetime
 
 import requests
@@ -451,7 +452,15 @@ class FilmApp(tk.Tk):
             activebackground=BORDER, activeforeground="#fff",
             padx=12, pady=6, command=self._logout_firebase,
         )
-        self.btn_scope_logout.pack(fill="x", padx=10, pady=(0, 10))
+        self.btn_scope_logout.pack(fill="x", padx=10, pady=(0, 6))
+
+        self.btn_import_export = tk.Button(
+            self.scope_card, text="📦 Import / Export", bg=PANEL, fg=TEXT,
+            font=("Segoe UI", 9), bd=0, cursor="hand2",
+            activebackground=ACCENT2, activeforeground="#fff",
+            padx=12, pady=6, command=self._import_export_dialog,
+        )
+        self.btn_import_export.pack(fill="x", padx=10, pady=(0, 10))
 
         if not _cloud_sync_moeglich():
             tk.Frame(sidebar, bg=BORDER, height=1).pack(fill="x", pady=(16, 0))
@@ -510,6 +519,276 @@ class FilmApp(tk.Tk):
     def _firebase_verbinden_dialog(self):
         """Öffnet die Einrichtungsanleitung für Firebase."""
         FirebaseVerbindenDialog(self)
+
+    def _import_export_dialog(self):
+        """Kleiner Dialog für JSON-Import/-Export und DB-Backup."""
+        dlg = tk.Toplevel(self)
+        dlg.title("Import / Export")
+        dlg.configure(bg=CARD)
+        dlg.resizable(False, False)
+        dlg.grab_set()
+        dlg.transient(self)
+
+        set_dark_title_bar(dlg)
+
+        tk.Label(
+            dlg,
+            text="Import / Export",
+            bg=CARD,
+            fg=TEXT,
+            font=("Segoe UI", 13, "bold"),
+        ).pack(anchor="w", padx=22, pady=(18, 4))
+
+        tk.Label(
+            dlg,
+            text="JSON nutzt immer den aktuell sichtbaren Bereich.\n"
+                 "DB-Backup speichert nur eine Kopie der aktuellen Datenbank.",
+            bg=CARD,
+            fg=MUTED,
+            font=("Segoe UI", 9),
+            justify="left",
+            wraplength=360,
+        ).pack(anchor="w", padx=22, pady=(0, 14))
+
+        btns = tk.Frame(dlg, bg=CARD)
+        btns.pack(fill="x", padx=22, pady=(0, 18))
+
+        def dialog_btn(text, command, bg=PANEL, fg=TEXT):
+            tk.Button(
+                btns, text=text, bg=bg, fg=fg,
+                font=("Segoe UI", 10, "bold"), bd=0, cursor="hand2",
+                activebackground=bg, activeforeground=fg,
+                padx=14, pady=8, command=lambda: (dlg.destroy(), command()),
+            ).pack(fill="x", pady=(0, 7))
+
+        dialog_btn("📤 Als JSON exportieren", self._export_json, ACCENT2, "#fff")
+        dialog_btn("📥 JSON importieren", self._import_json, ACCENT, "#fff")
+        dialog_btn("💾 Aktuelle DB als Backup speichern", self._backup_db, BORDER, TEXT)
+
+        tk.Button(
+            dlg, text="Abbrechen", bg=BORDER, fg=TEXT,
+            font=("Segoe UI", 10), bd=0, padx=18, pady=7,
+            cursor="hand2", command=dlg.destroy,
+        ).pack(anchor="e", padx=22, pady=(0, 18))
+
+        dlg.update_idletasks()
+        x = self.winfo_x() + (self.winfo_width() - dlg.winfo_width()) // 2
+        y = self.winfo_y() + (self.winfo_height() - dlg.winfo_height()) // 2
+        dlg.geometry(f"+{x}+{y}")
+
+    def _export_name_basis(self) -> str:
+        """Dateiname für Exporte passend zum aktuellen Bereich."""
+        if self._scope.get("mode") == "user":
+            basis = self._scope.get("email") or "cloud"
+        elif self._scope.get("mode") == "group":
+            basis = self._scope.get("group_name") or "gruppe"
+        else:
+            basis = "lokal"
+        sauber = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in str(basis))
+        zeit = datetime.now().strftime("%Y%m%d_%H%M")
+        return f"filmvault_{sauber}_{zeit}"
+
+    def _filme_als_dicts(self):
+        """Aktuelle Tabelle als einfache JSON-freundliche Dicts."""
+        felder = [
+            "id", "titel", "jahr", "bewertung", "genre", "gesehen",
+            "laufzeit", "imdb_bewertung", "imdb_id", "poster_url",
+            "gesehen_am", "updated_at",
+        ]
+        return [dict(zip(felder, row)) for row in db_alle()]
+
+    def _export_json(self):
+        """Exportiert die aktuell sichtbare Sammlung als JSON."""
+        pfad = filedialog.asksaveasfilename(
+            parent=self,
+            title="JSON exportieren",
+            defaultextension=".json",
+            initialfile=self._export_name_basis() + ".json",
+            filetypes=[("JSON-Dateien", "*.json"), ("Alle Dateien", "*.*")],
+        )
+        if not pfad:
+            return
+
+        daten = {
+            "app": "FilmVault",
+            "format": "filmvault-json-export",
+            "version": 1,
+            "exported_at": _now_iso(),
+            "scope": {
+                "mode": self._scope.get("mode"),
+                "email": self._scope.get("email"),
+                "group_name": self._scope.get("group_name"),
+                "group_code": self._scope.get("group_code"),
+            },
+            "filme": self._filme_als_dicts(),
+        }
+
+        try:
+            with open(pfad, "w", encoding="utf-8") as fh:
+                json.dump(daten, fh, ensure_ascii=False, indent=2)
+            messagebox.showinfo("Export fertig", f"JSON wurde gespeichert:\n{pfad}")
+        except Exception as exc:
+            traceback.print_exc()
+            messagebox.showerror("Export fehlgeschlagen", f"Die JSON-Datei konnte nicht gespeichert werden.\n\n{exc}")
+
+    def _wert_int(self, wert):
+        try:
+            if wert in (None, ""):
+                return None
+            return int(wert)
+        except Exception:
+            return None
+
+    def _wert_float(self, wert):
+        try:
+            if wert in (None, ""):
+                return None
+            return float(str(wert).replace(",", "."))
+        except Exception:
+            return None
+
+    def _import_json(self):
+        """Importiert Filme aus JSON in den aktuell aktiven Bereich."""
+        if self._offline_geblockt():
+            return
+
+        pfad = filedialog.askopenfilename(
+            parent=self,
+            title="JSON importieren",
+            filetypes=[("JSON-Dateien", "*.json"), ("Alle Dateien", "*.*")],
+        )
+        if not pfad:
+            return
+
+        try:
+            with open(pfad, "r", encoding="utf-8") as fh:
+                daten = json.load(fh)
+            filme = daten.get("filme") if isinstance(daten, dict) else daten
+            if not isinstance(filme, list):
+                raise ValueError("In der JSON-Datei wurde keine Filmliste gefunden.")
+        except Exception as exc:
+            messagebox.showerror("Import fehlgeschlagen", f"Die JSON-Datei konnte nicht gelesen werden.\n\n{exc}")
+            return
+
+        if not filme:
+            messagebox.showinfo("Import", "In der JSON-Datei sind keine Filme enthalten.")
+            return
+
+        if not messagebox.askyesno(
+            "JSON importieren?",
+            "Die Filme werden in den aktuell aktiven Bereich importiert.\n\n"
+            "Bereits vorhandene Filme werden über IMDb-ID oder Titel+Jahr übersprungen.\n\n"
+            "Jetzt importieren?",
+        ):
+            return
+
+        con = sqlite3.connect(DB_FILE)
+        con.row_factory = sqlite3.Row
+        cur = con.cursor()
+        importiert = 0
+        uebersprungen = 0
+
+        try:
+            for film in filme:
+                if not isinstance(film, dict):
+                    uebersprungen += 1
+                    continue
+
+                titel = str(film.get("titel") or "").strip()
+                if not titel:
+                    uebersprungen += 1
+                    continue
+
+                jahr = self._wert_int(film.get("jahr"))
+                imdb_id = str(film.get("imdb_id") or "").strip() or None
+
+                if imdb_id:
+                    cur.execute("SELECT 1 FROM filme WHERE imdb_id=? LIMIT 1", (imdb_id,))
+                else:
+                    cur.execute(
+                        "SELECT 1 FROM filme WHERE LOWER(titel)=LOWER(?) AND COALESCE(jahr, 0)=COALESCE(?, 0) LIMIT 1",
+                        (titel, jahr),
+                    )
+                if cur.fetchone():
+                    uebersprungen += 1
+                    continue
+
+                cur.execute("""
+                    INSERT INTO filme
+                        (titel, jahr, bewertung, genre, gesehen, laufzeit, imdb_bewertung,
+                         imdb_id, poster_url, gesehen_am, updated_at)
+                    VALUES
+                        (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    titel,
+                    jahr,
+                    self._wert_float(film.get("bewertung")),
+                    film.get("genre") or None,
+                    int(film.get("gesehen") or 0),
+                    self._wert_int(film.get("laufzeit")),
+                    self._wert_float(film.get("imdb_bewertung")),
+                    imdb_id,
+                    film.get("poster_url") or None,
+                    film.get("gesehen_am") or None,
+                    _now_iso(),
+                ))
+                importiert += 1
+
+            con.commit()
+        except Exception as exc:
+            con.rollback()
+            traceback.print_exc()
+            messagebox.showerror("Import fehlgeschlagen", f"Beim Import ist ein Fehler aufgetreten.\n\n{exc}")
+            return
+        finally:
+            con.close()
+
+        hochgeladen = False
+        if importiert and self._scope.get("mode") in ("user", "group") and not self._offline:
+            try:
+                firestore_push_all_filme_sync()
+                hochgeladen = True
+            except Exception:
+                traceback.print_exc()
+                messagebox.showwarning(
+                    "Import nicht vollständig synchronisiert",
+                    "Die Filme wurden lokal in den aktuellen Cloudbereich importiert, "
+                    "konnten aber gerade nicht nach Firestore hochgeladen werden.",
+                )
+
+        self.aktualisieren()
+        self._refresh_scope_ui()
+
+        zusatz = "\nDie neuen Filme wurden nach Firestore hochgeladen." if hochgeladen else ""
+        messagebox.showinfo(
+            "Import fertig",
+            f"Importiert: {importiert}\nÜbersprungen: {uebersprungen}{zusatz}",
+        )
+
+    def _backup_db(self):
+        """Speichert eine saubere Kopie der aktuell aktiven SQLite-DB."""
+        pfad = filedialog.asksaveasfilename(
+            parent=self,
+            title="DB-Backup speichern",
+            defaultextension=".db",
+            initialfile=self._export_name_basis() + ".db",
+            filetypes=[("SQLite-Datenbank", "*.db"), ("Alle Dateien", "*.*")],
+        )
+        if not pfad:
+            return
+
+        try:
+            src = sqlite3.connect(DB_FILE)
+            dst = sqlite3.connect(pfad)
+            try:
+                src.backup(dst)
+            finally:
+                dst.close()
+                src.close()
+            messagebox.showinfo("Backup fertig", f"Datenbank-Backup wurde gespeichert:\n{pfad}")
+        except Exception as exc:
+            traceback.print_exc()
+            messagebox.showerror("Backup fehlgeschlagen", f"Das DB-Backup konnte nicht gespeichert werden.\n\n{exc}")
 
     def _scope_zu_lokal(self):
         if self._scope.get("mode") == "local":
@@ -757,6 +1036,38 @@ class FilmApp(tk.Tk):
         hinzufuegen_btn.pack(side="right")
         frame._hinzufuegen_btn = hinzufuegen_btn
 
+        # Suchfeld filtert nur die sichtbare Tabelle.
+        # Das ist auch offline erlaubt, weil nichts gespeichert oder synchronisiert wird.
+        such_frame = tk.Frame(header, bg=BG)
+        such_frame.pack(side="right", padx=(0, 12))
+
+        tk.Label(
+            such_frame,
+            text="Suche:",
+            bg=BG,
+            fg=MUTED,
+            font=("Segoe UI", 9, "bold")
+        ).pack(side="left", padx=(0, 6))
+
+        such_var = tk.StringVar()
+        such_entry = tk.Entry(
+            such_frame,
+            textvariable=such_var,
+            bg="#0d0d14",
+            fg=TEXT,
+            insertbackground=TEXT,
+            font=("Segoe UI", 10),
+            bd=0,
+            relief="flat",
+            width=22,
+            highlightthickness=1,
+            highlightbackground=BORDER,
+            highlightcolor=ACCENT
+        )
+        such_entry.pack(side="left", ipady=4)
+
+        frame._such_var = such_var
+
         tk.Frame(frame, bg=BORDER, height=1).pack(fill="x", padx=24)
 
         # Tabelle + Buttons nebeneinander in einem gemeinsamen Container
@@ -823,6 +1134,11 @@ class FilmApp(tk.Tk):
         tree.bind("<Leave>", lambda e: self._hide_hover_poster())
 
         frame._tree = tree
+
+        # Erst nachdem der Tree existiert, auf Texteingaben reagieren.
+        # Es wird nur neu gefiltert, nicht gespeichert.
+        frame._such_var.trace_add("write", lambda *_: self.aktualisieren())
+
         return frame
 
     def _sortiere(self, tree, spalte, frame):
@@ -892,6 +1208,17 @@ class FilmApp(tk.Tk):
         # sonst feuert TreeviewSelect mitten im Delete/Insert und triggert
         # ungewollt Callbacks im Hauptthread.
         tree.unbind("<<TreeviewSelect>>")
+
+        # Suchfilter nur auf den Titel anwenden.
+        # Wichtig: Das filtert nur die Anzeige, nicht die Datenbank.
+        if frame is not None and hasattr(frame, "_such_var"):
+            suchtext = frame._such_var.get().strip().lower()
+            if suchtext:
+                begriffe = [b for b in suchtext.split() if b]
+                rows = [
+                    r for r in rows
+                    if all(b in str(r[1] or "").lower() for b in begriffe)
+                ]
 
         tree.delete(*tree.get_children())
         for r in rows:
