@@ -1,0 +1,266 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ─────────────────────────────────────────────────────────
+    //  Allgemeine Helfer
+    // ─────────────────────────────────────────────────────────
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isSelf(uid) {
+      return signedIn() && request.auth.uid == uid;
+    }
+
+    function memberPath(groupId, uid) {
+      return /databases/$(database)/documents/groups/$(groupId)/members/$(uid);
+    }
+
+    function groupPath(groupId) {
+      return /databases/$(database)/documents/groups/$(groupId);
+    }
+
+    function isActiveMember(groupId) {
+      return signedIn()
+        && exists(memberPath(groupId, request.auth.uid))
+        && get(memberPath(groupId, request.auth.uid)).data.status == "active";
+    }
+
+    function myRole(groupId) {
+      return get(memberPath(groupId, request.auth.uid)).data.role;
+    }
+
+    function isOwner(groupId) {
+      return isActiveMember(groupId)
+        && myRole(groupId) == "owner";
+    }
+
+    function isAdmin(groupId) {
+      return isActiveMember(groupId)
+        && myRole(groupId) == "admin";
+    }
+
+    function isOwnerOrAdmin(groupId) {
+      return isOwner(groupId) || isAdmin(groupId);
+    }
+
+    function canReadGroup(groupId) {
+      return isActiveMember(groupId);
+    }
+
+    function canWriteFilms(groupId) {
+      return isActiveMember(groupId)
+        && myRole(groupId) in ["owner", "admin", "member"];
+    }
+
+    function validRole(role) {
+      return role in ["owner", "admin", "member", "readonly"];
+    }
+
+    function validMemberDoc() {
+      return request.resource.data.role in ["owner", "admin", "member", "readonly"]
+        && request.resource.data.status == "active";
+    }
+
+    function targetIsNormalMember() {
+      return resource.data.role in ["member", "readonly"];
+    }
+
+    function newRoleIsNormalMember() {
+      return request.resource.data.role in ["member", "readonly"];
+    }
+
+    // ─────────────────────────────────────────────────────────
+    //  Persönlicher Cloudbereich
+    // ─────────────────────────────────────────────────────────
+
+    match /users/{uid}/filme/{filmId} {
+      allow read, write: if isSelf(uid);
+    }
+
+    match /users/{uid}/_meta/{docId} {
+      allow read, write: if isSelf(uid);
+    }
+
+    // Optionaler Fallback für spätere User-Unterdaten
+    match /users/{uid}/{document=**} {
+      allow read, write: if isSelf(uid);
+    }
+
+    // ─────────────────────────────────────────────────────────
+    //  Gruppencodes
+    //  Code dient nur zum Finden der Gruppe.
+    //  Die echte Berechtigung kommt danach über members/{uid}.
+    // ─────────────────────────────────────────────────────────
+
+    match /groupCodes/{code} {
+      allow read: if signedIn();
+
+      allow create: if signedIn()
+        && request.resource.data.created_by == request.auth.uid
+        && request.resource.data.group_id is string
+        && request.resource.data.group_name is string;
+
+      allow update, delete: if signedIn()
+        && resource.data.group_id is string
+        && isOwner(resource.data.group_id);
+    }
+
+    // ─────────────────────────────────────────────────────────
+    //  Gruppendokument
+    // ─────────────────────────────────────────────────────────
+
+    match /groups/{groupId} {
+      // Lesen ist für eingeloggte Nutzer erlaubt,
+      // damit Beitritt über Code / join_mode funktionieren kann.
+      allow read: if signedIn();
+
+      // Neue Gruppe darf vom eingeloggten Ersteller angelegt werden.
+      allow create: if signedIn()
+        && request.resource.data.created_by == request.auth.uid;
+
+      // Normale Gruppeneinstellungen nur Owner.
+      // Ausnahme: Owner-Transfer kann owner_uid/owner_email aktualisieren,
+      // auch wenn der alte Owner in members schon zu admin wurde.
+      allow update: if isOwner(groupId)
+        || (
+          signedIn()
+          && resource.data.owner_uid == request.auth.uid
+          && request.resource.data.diff(resource.data).changedKeys()
+            .hasOnly(["owner_uid", "owner_email", "updated_at"])
+        );
+
+      allow delete: if isOwner(groupId);
+    }
+
+    // ─────────────────────────────────────────────────────────
+    //  Gruppenfilme
+    // ─────────────────────────────────────────────────────────
+
+    match /groups/{groupId}/filme/{filmId} {
+      allow read: if canReadGroup(groupId);
+      allow create, update, delete: if canWriteFilms(groupId);
+    }
+
+    // ─────────────────────────────────────────────────────────
+    //  Gruppen-Meta-Sync
+    // ─────────────────────────────────────────────────────────
+
+    match /groups/{groupId}/_meta/{docId} {
+      allow read: if canReadGroup(groupId);
+      allow create, update, delete: if canWriteFilms(groupId);
+    }
+
+    // ─────────────────────────────────────────────────────────
+    //  Gruppenmitglieder / Rollen
+    // ─────────────────────────────────────────────────────────
+
+    match /groups/{groupId}/members/{uid} {
+      allow read: if canReadGroup(groupId);
+
+      // Gruppenersteller legt sich selbst als Owner an.
+      allow create: if signedIn()
+        && uid == request.auth.uid
+        && request.resource.data.role == "owner"
+        && request.resource.data.status == "active"
+        && exists(groupPath(groupId))
+        && get(groupPath(groupId)).data.created_by == request.auth.uid;
+
+      // Direkter Code-Beitritt:
+      // Nutzer darf sich selbst als member eintragen,
+      // aber nur wenn die Gruppe code_open ist.
+      allow create: if signedIn()
+        && uid == request.auth.uid
+        && request.resource.data.role == "member"
+        && request.resource.data.status == "active"
+        && exists(groupPath(groupId))
+        && get(groupPath(groupId)).data.join_mode == "code_open";
+
+      // Owner darf Mitglieder anlegen, inklusive admin/member/readonly.
+      allow create: if isOwner(groupId)
+        && validMemberDoc();
+
+      // Admin darf nur member/readonly anlegen.
+      allow create: if isAdmin(groupId)
+        && request.resource.data.role in ["member", "readonly"]
+        && request.resource.data.status == "active";
+
+      // Owner darf Rollen ändern.
+      // Enthält auch Owner-Übertragung:
+      // - anderer Nutzer kann owner werden
+      // - aktueller Owner kann danach zu admin werden
+      allow update: if isOwner(groupId)
+        && validRole(request.resource.data.role)
+        && request.resource.data.status == "active"
+        && (
+          uid != request.auth.uid
+          || (
+            uid == request.auth.uid
+            && resource.data.role == "owner"
+            && request.resource.data.role == "admin"
+          )
+        );
+
+      // Admin darf nur member/readonly verwalten.
+      // Keine Owner, keine Admins, keine Selbst-Hochstufung.
+      allow update: if isAdmin(groupId)
+        && uid != request.auth.uid
+        && targetIsNormalMember()
+        && newRoleIsNormalMember()
+        && request.resource.data.status == "active";
+
+      // Niemand darf sich selbst entfernen.
+      // Owner darf keine Owner-Dokumente löschen.
+      allow delete: if isOwner(groupId)
+        && uid != request.auth.uid
+        && resource.data.role != "owner";
+
+      // Admin darf nur member/readonly entfernen.
+      allow delete: if isAdmin(groupId)
+        && uid != request.auth.uid
+        && targetIsNormalMember();
+    }
+
+    // ─────────────────────────────────────────────────────────
+    //  Beitrittsanfragen
+    // ─────────────────────────────────────────────────────────
+
+    match /groups/{groupId}/joinRequests/{uid} {
+      // Nutzer darf eigene Anfrage stellen.
+      allow create: if signedIn()
+        && uid == request.auth.uid
+        && request.resource.data.status == "pending";
+
+      // Nutzer darf eigene Anfrage lesen.
+      // Owner/Admin darf alle Anfragen lesen.
+      allow read: if isSelf(uid) || isOwnerOrAdmin(groupId);
+
+      // Owner/Admin darf Anfrage annehmen/ablehnen.
+      allow update, delete: if isOwnerOrAdmin(groupId);
+    }
+
+    // ─────────────────────────────────────────────────────────
+    //  Optionale Einladungen
+    // ─────────────────────────────────────────────────────────
+
+    match /groups/{groupId}/invites/{inviteId} {
+      allow read: if isOwnerOrAdmin(groupId);
+
+      allow create, update, delete: if isOwner(groupId);
+
+      allow create, update, delete: if isAdmin(groupId)
+        && request.resource.data.role in ["member", "readonly"];
+    }
+
+    // ─────────────────────────────────────────────────────────
+    //  Alles andere blocken
+    // ─────────────────────────────────────────────────────────
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
