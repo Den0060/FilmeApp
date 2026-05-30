@@ -814,6 +814,31 @@ def _gruppe_member_laden_mit_token(id_token: str, group_id: str, uid: str) -> di
     return data
 
 
+def gruppe_eigene_mitgliedschaft_laden() -> dict | None:
+    """Lädt die eigene Mitgliedschaft der aktuell geöffneten Gruppe.
+
+    Wird von der App benutzt, wenn Firestore wegen Berechtigungen blockt.
+    So kann unterschieden werden zwischen:
+    - Anmeldung/Rechteproblem
+    - Nutzer wurde aus der Gruppe entfernt
+    """
+    if CURRENT_SCOPE.get("mode") != "group":
+        return None
+
+    group_id = CURRENT_SCOPE.get("group_id")
+    uid = CURRENT_SCOPE.get("uid")
+    if not group_id or not uid:
+        return None
+
+    doc = _firestore_request("GET", _gruppe_member_pfad(group_id, uid))
+    if not doc:
+        return None
+
+    data = _fs_doc_to_dict(doc)
+    data["uid"] = data.get("uid") or uid
+    return data
+
+
 def _gruppe_member_speichern_mit_token(id_token: str, group_id: str, uid: str, email: str, role: str = "member") -> dict:
     """Legt einen Gruppen-Member an oder aktualisiert ihn."""
     role = str(role or "member").lower()

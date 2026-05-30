@@ -26,6 +26,7 @@ from .core import (
     _gruppe_mitglied_entfernen,
     _gruppe_mitglied_rolle_setzen,
     _gruppe_owner_uebertragen,
+    gruppe_eigene_mitgliedschaft_laden,
     _gruppe_beitrittsanfragen_laden,
     _gruppe_beitrittsanfrage_annehmen,
     _gruppe_beitrittsanfrage_ablehnen,
@@ -216,6 +217,8 @@ class FilmApp(tk.Tk):
         self._offline = start_aus_cache if self._scope.get("mode") in ("group", "user") else False
         self._startup_offline_banner_suppressed = bool(
             self._offline and self._scope.get("mode") in ("group", "user"))
+        self._auth_problem = False
+        self._group_removed = False
 
         # Beim Start immer Vollsync im Cloudmodus – so werden auch remote hart gelöschte Dokumente
         # lokal entfernt, weil der ID-Abgleich (verwaist) bei force_full=True läuft
@@ -225,8 +228,12 @@ class FilmApp(tk.Tk):
             except Exception as exc:
                 # Wenn Firestore trotz DNS-Onlineprüfung nicht erreichbar ist,
                 # bleiben wir im Cloud-/Gruppenscope, sperren aber Schreibaktionen.
-                self._offline = True
                 print(f"Cloud-Sync beim Start nicht erreichbar: {exc}")
+                if self._ist_auth_oder_rechtefehler(exc):
+                    self._offline = False
+                    self._auth_problem = True
+                else:
+                    self._offline = True
 
         self.title("🎬 FilmVault")
         self.geometry("1300x740")
@@ -264,6 +271,45 @@ class FilmApp(tk.Tk):
 
     # ── Offline-Handling ───────────────────────────────────
 
+    def _ist_auth_oder_rechtefehler(self, exc) -> bool:
+        """Erkennt Fehler, bei denen eher Anmeldung/Rechte statt Internet das Problem sind."""
+        text = str(exc).lower()
+        return (
+            "missing or insufficient permissions" in text
+            or "permission_denied" in text
+            or "permission denied" in text
+            or "403" in text
+            or "401" in text
+            or "unauthorized" in text
+            or "token" in text
+        )
+
+    def _pruefe_ob_aus_gruppe_entfernt(self) -> bool:
+        """Prüft bei Rechtefehlern, ob der Nutzer aus der aktuellen Gruppe entfernt wurde."""
+        if self._scope.get("mode") != "group":
+            return False
+
+        try:
+            member = gruppe_eigene_mitgliedschaft_laden()
+        except Exception:
+            # Wenn selbst diese Prüfung nicht klappt, bleibt es ein normales Auth-/Rechteproblem.
+            return False
+
+        if not member or str(member.get("status") or "").lower() != "active":
+            self._offline = False
+            self._auth_problem = False
+            self._group_removed = True
+            self.after(0, lambda: self._set_sync_status("Aus Gruppe entfernt"))
+            self.after(0, self._update_offline_banner)
+            self.after(0, self._refresh_scope_ui)
+            return True
+
+        # Falls die Mitgliedschaft wieder aktiv ist, den Zustand zurücknehmen.
+        self._group_removed = False
+        self._scope["group_role"] = member.get("role") or self._scope.get("group_role") or "member"
+        self._scope["group_status"] = member.get("status") or "active"
+        return False
+
     def _periodic_online_check(self):
         """Prüft ob sich der Online-Status geändert hat.
         Offline wird häufiger geprüft, damit die App ohne Neustart
@@ -281,8 +327,10 @@ class FilmApp(tk.Tk):
             # Im Lokalmodus nichts an Firebase anfassen, aber den Timer
             # weiterlaufen lassen. Der User kann später in Cloud/Gruppe wechseln.
             if self._scope.get("mode") not in ("group", "user"):
-                if self._offline:
+                if self._offline or getattr(self, "_group_removed", False) or getattr(self, "_auth_problem", False):
                     self._offline = False
+                    self._auth_problem = False
+                    self._group_removed = False
                     self.after(0, ui_update)
                 return
 
@@ -304,22 +352,41 @@ class FilmApp(tk.Tk):
                     self._scope = dict(CURRENT_SCOPE)
                     db_init()
                     self._offline = False
+                    self._auth_problem = False
+                    self._group_removed = False
                     self.after(0, lambda: self._set_sync_status("Sync prüft..."))
 
                     try:
                         sync_geaendert = firestore_pull_updates(force_full=not _db_hat_filme(DB_FILE))
                     except Exception as exc:
-                        # Internet ist laut Kurzprüfung wieder da, aber Firestore
-                        # selbst ist noch nicht erreichbar. Dann weiter gesperrt lassen.
+                        # Internet ist da, aber Firestore kann trotzdem wegen Auth/Rules blocken.
+                        # Dann nicht "offline" anzeigen, sondern klar auf Anmeldung/Rechte hinweisen.
                         print(f"Cloud-Reconnect noch nicht möglich: {exc}")
-                        self._offline = True
-                        self.after(0, lambda: self._set_sync_status("Sync: offline"))
+
+                        if self._ist_auth_oder_rechtefehler(exc):
+                            if self._pruefe_ob_aus_gruppe_entfernt():
+                                return
+                            self._offline = False
+                            self._auth_problem = True
+                            self._group_removed = False
+                            self.after(0, lambda: self._set_sync_status("Sync: Anmeldung prüfen"))
+                        else:
+                            self._offline = True
+                            self._auth_problem = False
+                            self._group_removed = False
+                            self.after(0, lambda: self._set_sync_status("Sync: offline"))
                 else:
                     # Internet ist da, aber die Firebase-Session konnte nicht
-                    # erneuert werden. Dann lieber weiterhin nur lesend bleiben.
-                    self._offline = True
+                    # erneuert werden. Dann klar als Anmeldeproblem anzeigen.
+                    self._offline = False
+                    self._auth_problem = True
+                    self._group_removed = False
+                    self.after(0, lambda: self._set_sync_status("Sync: Anmeldung prüfen"))
             else:
                 self._offline = ist_offline
+                if ist_offline:
+                    self._auth_problem = False
+                    self._group_removed = False
 
             startup_banner_war_unterdrueckt = getattr(self, "_startup_offline_banner_suppressed", False)
             if startup_banner_war_unterdrueckt:
@@ -356,6 +423,7 @@ class FilmApp(tk.Tk):
         return (
             self._scope.get("mode") == "group"
             and not self._offline
+            and not getattr(self, "_group_removed", False)
             and str(self._scope.get("group_role") or "member").lower() in ("owner", "admin")
         )
 
@@ -370,7 +438,11 @@ class FilmApp(tk.Tk):
         else:
             self._offline_banner.pack_forget()
 
-        self._set_aktionen_gesperrt(offline_cloud)
+        self._set_aktionen_gesperrt(
+            offline_cloud
+            or getattr(self, "_auth_problem", False)
+            or getattr(self, "_group_removed", False)
+        )
 
     def _set_aktionen_gesperrt(self, gesperrt: bool):
         """Alle Schreib-Buttons deaktivieren wenn offline oder nur lesend."""
@@ -388,6 +460,22 @@ class FilmApp(tk.Tk):
         Gibt True zurück und zeigt Meldung wenn offline im Cloudmodus.
         Im Lokalmodus ist man nie geblockt – man schreibt immer lokal.
         """
+        if getattr(self, "_group_removed", False):
+            messagebox.showwarning(
+                "Aus Gruppe entfernt",
+                "Du bist kein aktives Mitglied dieser Gruppe mehr.\n\n"
+                "Du kannst lokal weiterarbeiten oder einen anderen Cloud-Bereich öffnen.",
+            )
+            return True
+
+        if getattr(self, "_auth_problem", False):
+            messagebox.showwarning(
+                "Anmeldung prüfen",
+                "Firebase hat die aktuelle Sitzung oder die Rechte abgelehnt.\n\n"
+                "Bitte öffne den Cloud-Bereich erneut oder melde dich neu an.",
+            )
+            return True
+
         if self._scope.get("mode") in ("group", "user") and self._offline:
             messagebox.showwarning(
                 "Kein Internet",
@@ -502,10 +590,29 @@ class FilmApp(tk.Tk):
         self.scope_card = tk.Frame(sidebar, bg=CARD, highlightthickness=1, highlightbackground=BORDER)
         self.scope_card.pack(fill="x", padx=14, pady=(14, 10))
 
-        self.scope_title_lbl = tk.Label(self.scope_card, text="", bg=CARD, fg=TEXT, font=("Segoe UI", 10, "bold"), wraplength=190, justify="left")
-        self.scope_title_lbl.pack(anchor="w", padx=12, pady=(10, 2))
-        self.scope_detail_lbl = tk.Label(self.scope_card, text="", bg=CARD, fg=MUTED, font=("Segoe UI", 8), wraplength=190, justify="left")
-        self.scope_detail_lbl.pack(anchor="w", padx=12, pady=(0, 8))
+        self.scope_title_lbl = tk.Label(
+            self.scope_card,
+            text="",
+            bg=CARD,
+            fg=TEXT,
+            font=("Segoe UI", 10, "bold"),
+            wraplength=190,
+            justify="left",
+            anchor="w",
+        )
+        self.scope_title_lbl.pack(fill="x", anchor="w", padx=12, pady=(10, 2))
+
+        self.scope_detail_lbl = tk.Label(
+            self.scope_card,
+            text="",
+            bg=CARD,
+            fg=MUTED,
+            font=("Segoe UI", 8),
+            wraplength=190,
+            justify="left",
+            anchor="w",
+        )
+        self.scope_detail_lbl.pack(fill="x", anchor="w", padx=12, pady=(0, 8))
 
         self.btn_scope_local = tk.Button(
             self.scope_card, text="🏠 Lokal", bg=PANEL, fg=TEXT,
@@ -650,7 +757,7 @@ class FilmApp(tk.Tk):
 
         import_gesperrt = (
             self._scope.get("mode") in ("group", "user") and self._offline
-        ) or self._cloud_schreibgeschuetzt()
+        ) or self._cloud_schreibgeschuetzt() or getattr(self, "_auth_problem", False) or getattr(self, "_group_removed", False)
 
         dialog_btn("📤 Als JSON exportieren", self._export_json, ACCENT2, "#fff")
         dialog_btn("📥 JSON importieren", self._import_json, ACCENT, "#fff", "disabled" if import_gesperrt else "normal")
@@ -1156,6 +1263,8 @@ class FilmApp(tk.Tk):
         self._scope = dict(CURRENT_SCOPE)
         db_init()
         self._offline = False
+        self._auth_problem = False
+        self._group_removed = False
         self._reset_scope_caches()
         self.aktualisieren()
         self._refresh_scope_ui()
@@ -1203,6 +1312,8 @@ class FilmApp(tk.Tk):
         self._scope = dict(CURRENT_SCOPE)
         db_init()
         self._offline = not _internet_verfuegbar()
+        self._auth_problem = False
+        self._group_removed = False
         self._reset_scope_caches()
 
         lokale_uebernahme = 0
@@ -1305,6 +1416,8 @@ class FilmApp(tk.Tk):
         self._scope = dict(CURRENT_SCOPE)
         db_init()
         self._offline = False
+        self._auth_problem = False
+        self._group_removed = False
         self._reset_scope_caches()
         self.aktualisieren()
         self._refresh_scope_ui()
@@ -1321,6 +1434,12 @@ class FilmApp(tk.Tk):
         if self._scope.get("mode") == "local":
             return "Sync aus"
 
+        if getattr(self, "_group_removed", False):
+            return "Aus Gruppe entfernt"
+
+        if getattr(self, "_auth_problem", False):
+            return "Sync: Anmeldung prüfen"
+
         if self._offline:
             return "Sync: offline"
 
@@ -1332,11 +1451,19 @@ class FilmApp(tk.Tk):
         if hasattr(self, "_status_var"):
             self._refresh_scope_ui()
 
+    def _sidebar_kurz(self, text, max_len=26):
+        """Kürzt lange Texte für die Sidebar, damit sie nicht umbrechen."""
+        text = str(text or "")
+        if len(text) <= max_len:
+            return text
+        return text[:max_len - 3] + "..."
+
     def _refresh_scope_ui(self):
         if self._scope.get("mode") == "user":
             self.scope_title_lbl.configure(text="☁ Persönlich")
             ver = "verifiziert" if self._scope.get("email_verified") else "nicht verifiziert"
-            self.scope_detail_lbl.configure(text=f"{self._scope.get('email') or 'ohne Mail'}\n{ver}")
+            email_kurz = self._sidebar_kurz(self._scope.get("email") or "ohne Mail")
+            self.scope_detail_lbl.configure(text=f"{email_kurz}\n{ver}")
             self._status_var.set(f"Persönlicher Cloudbereich · {self._scope.get('email') or 'angemeldet'} · {self._sync_status_label()}")
             self.btn_scope_local.configure(state="normal")
             self.btn_scope_group.configure(text="🔄 Cloud wechseln", state="normal")
@@ -1347,7 +1474,9 @@ class FilmApp(tk.Tk):
             ver = "verifiziert" if self._scope.get("email_verified") else "nicht verifiziert"
             code = self._scope.get("group_code") or "kein Code gespeichert"
             rolle = self._rolle_anzeigen()
-            self.scope_detail_lbl.configure(text=f"{self._scope.get('email') or 'ohne Mail'}\n{ver}\nRolle: {rolle}\nCode: {code}")
+            hinweis = "\nKein aktives Gruppenmitglied" if getattr(self, "_group_removed", False) else ""
+            email_kurz = self._sidebar_kurz(self._scope.get("email") or "ohne Mail")
+            self.scope_detail_lbl.configure(text=f"{email_kurz}\n{ver}\nRolle: {rolle}\nCode: {code}{hinweis}")
             self._status_var.set(f"Gruppe · {self._scope.get('group_name') or 'Gruppe'} · {rolle} · {self._sync_status_label()}")
             self.btn_scope_local.configure(state="normal")
             self.btn_scope_group.configure(text="🔄 Cloud wechseln", state="normal")
@@ -1794,6 +1923,10 @@ class FilmApp(tk.Tk):
             self.after(SYNC_INTERVAL_MS, self._periodic_remote_sync)
             return
 
+        if getattr(self, "_group_removed", False):
+            self.after(SYNC_INTERVAL_MS, self._periodic_remote_sync)
+            return
+
         scope_snapshot = dict(self._scope)
         self._set_sync_status("Sync läuft...")
 
@@ -1814,6 +1947,8 @@ class FilmApp(tk.Tk):
                 geaendert = firestore_pull_updates(force_full=False)
 
                 if same_scope_as_start():
+                    self._auth_problem = False
+                    self._group_removed = False
                     zeit = datetime.now().strftime("%H:%M")
                     if geaendert:
                         self.after(0, self.aktualisieren)
@@ -1822,13 +1957,21 @@ class FilmApp(tk.Tk):
                         self.after(0, lambda: self._set_sync_status(f"Sync: aktuell {zeit}"))
 
             except Exception as exc:
-                # Wenn die App online gestartet ist und danach Internet weg ist,
-                # merkt es oft zuerst dieser Firestore-Meta-Sync.
-                # Dann nicht crashen, sondern Cloudmodus auf Nur-Lesen setzen.
                 print(f"Cloud-Sync nicht erreichbar: {exc}")
                 if same_scope_as_start() and self._scope.get("mode") in ("group", "user"):
-                    self._offline = True
-                    self.after(0, lambda: self._set_sync_status("Sync: offline"))
+                    if self._ist_auth_oder_rechtefehler(exc):
+                        if self._pruefe_ob_aus_gruppe_entfernt():
+                            return
+                        self._offline = False
+                        self._auth_problem = True
+                        self._group_removed = False
+                        self.after(0, lambda: self._set_sync_status("Sync: Anmeldung prüfen"))
+                    else:
+                        self._offline = True
+                        self._auth_problem = False
+                        self._group_removed = False
+                        self.after(0, lambda: self._set_sync_status("Sync: offline"))
+
                     self.after(0, self._update_offline_banner)
                     self.after(0, self._refresh_scope_ui)
 
