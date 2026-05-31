@@ -310,6 +310,42 @@ class FilmApp(tk.Tk):
         self._scope["group_status"] = member.get("status") or "active"
         return False
 
+    def _eigene_gruppenrechte_aktualisieren(self) -> bool:
+        """
+        Lädt die eigene Rolle neu.
+        Wichtig, wenn Owner/Admin die Rolle auf einem anderen Gerät geändert hat.
+        Gibt True zurück, wenn sich Rolle/Status geändert haben.
+        """
+        if self._scope.get("mode") != "group":
+            return False
+
+        try:
+            member = gruppe_eigene_mitgliedschaft_laden()
+        except Exception:
+            return False
+
+        if not member:
+            return False
+
+        neue_rolle = str(member.get("role") or "member").lower()
+        neuer_status = str(member.get("status") or "active").lower()
+
+        alte_rolle = str(self._scope.get("group_role") or "member").lower()
+        alter_status = str(self._scope.get("group_status") or "active").lower()
+
+        if neue_rolle == alte_rolle and neuer_status == alter_status:
+            return False
+
+        self._scope["group_role"] = neue_rolle
+        self._scope["group_status"] = neuer_status
+
+        # Core-State auch aktualisieren, weil Schreibfunktionen dort prüfen.
+        _core.CURRENT_SCOPE["group_role"] = neue_rolle
+        _core.CURRENT_SCOPE["group_status"] = neuer_status
+
+        _save_auth_state(self._scope)
+        return True
+
     def _periodic_online_check(self):
         """Prüft ob sich der Online-Status geändert hat.
         Offline wird häufiger geprüft, damit die App ohne Neustart
@@ -1717,7 +1753,15 @@ class FilmApp(tk.Tk):
             genre_str    = genre if genre else "–"
             laufzeit_str = f"{laufzeit} min" if laufzeit else "–"
             imdb_str     = f"{imdb_bew:.1f}" if imdb_bew is not None else "–"
-            status       = f"✅ {gesehen_am[:10]}" if gesehen_am else "👁 Watchlist"
+            if gesehen_am:
+                try:
+                    jahr_datum = str(gesehen_am)[:10]  # z.B. 2026-05-30
+                    jahr, monat, tag = jahr_datum.split("-")
+                    status = f"✅ {tag}.{monat}.{jahr}" # für das Deutsche Format
+                except Exception:
+                    status = f"✅ {gesehen_am}"
+            else:
+                status = "👁 Watchlist"
             tag          = "gesehen" if gesehen else "offen"
 
             tree.insert("", "end", iid=str(fid),
@@ -1945,11 +1989,15 @@ class FilmApp(tk.Tk):
                     return
 
                 geaendert = firestore_pull_updates(force_full=False)
+                rechte_geaendert = self._eigene_gruppenrechte_aktualisieren()
 
                 if same_scope_as_start():
                     self._auth_problem = False
                     self._group_removed = False
                     zeit = datetime.now().strftime("%H:%M")
+                    if rechte_geaendert:
+                        self.after(0, self._refresh_scope_ui)
+                        self.after(0, self._update_offline_banner)
                     if geaendert:
                         self.after(0, self.aktualisieren)
                         self.after(0, lambda: self._set_sync_status(f"Sync: aktualisiert {zeit}"))

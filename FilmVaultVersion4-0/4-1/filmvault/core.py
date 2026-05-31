@@ -68,8 +68,8 @@ def _load_env():
     - .env neben der .py/.exe zum einfachen Ändern
     - .env per PyInstaller --add-data in die EXE gepackt
     """
-    env_neben_app = os.path.join(BASE_DIR, "../.env")
-    env_im_bundle = os.path.join(_resource_base(), "../.env")
+    env_neben_app = os.path.join(BASE_DIR, "./.env")
+    env_im_bundle = os.path.join(_resource_base(), "./.env")
 
     load_dotenv(env_im_bundle, override=False)
     load_dotenv(env_neben_app, override=True)
