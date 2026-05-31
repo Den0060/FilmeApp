@@ -1587,7 +1587,29 @@ class FilmApp(tk.Tk):
         )
         such_entry.pack(side="left", ipady=4)
 
+        def suchfeld_leeren():
+            such_var.set("")
+            such_entry.focus_set()
+
+        such_clear_btn = tk.Button(
+            such_frame,
+            text="×",
+            bg=BORDER,
+            fg=TEXT,
+            font=("Segoe UI", 9, "bold"),
+            bd=0,
+            width=2,
+            cursor="hand2",
+            activebackground=ACCENT2,
+            activeforeground="#fff",
+            command=suchfeld_leeren,
+        )
+        such_clear_btn.pack(side="left", padx=(5, 0), ipady=1)
+        such_clear_btn.pack_forget()
+
         frame._such_var = such_var
+        frame._such_clear_btn = such_clear_btn
+        frame._such_clear_sichtbar = False
 
         tk.Frame(frame, bg=BORDER, height=1).pack(fill="x", padx=24)
 
@@ -1658,7 +1680,19 @@ class FilmApp(tk.Tk):
 
         # Erst nachdem der Tree existiert, auf Texteingaben reagieren.
         # Es wird nur neu gefiltert, nicht gespeichert.
-        frame._such_var.trace_add("write", lambda *_: self.aktualisieren())
+        def suchfeld_geaendert(*_):
+            hat_text = bool(frame._such_var.get().strip())
+
+            if hat_text and not frame._such_clear_sichtbar:
+                frame._such_clear_btn.pack(side="left", padx=(5, 0), ipady=1)
+                frame._such_clear_sichtbar = True
+            elif not hat_text and frame._such_clear_sichtbar:
+                frame._such_clear_btn.pack_forget()
+                frame._such_clear_sichtbar = False
+
+            self.aktualisieren()
+
+        frame._such_var.trace_add("write", suchfeld_geaendert)
 
         return frame
 

@@ -289,7 +289,7 @@ class FirebaseCloudDialog(tk.Toplevel):
         form = tk.Frame(self, bg=CARD)
         form.pack(fill="x", padx=24)
 
-        self.scope_var = tk.StringVar(value=preset_mode if preset_mode in ("user", "group") else "user")
+        self.scope_var = tk.StringVar(value="user")
         mode_row = tk.Frame(form, bg=CARD)
         mode_row.pack(fill="x", pady=(0, 6))
         tk.Radiobutton(
@@ -381,15 +381,53 @@ class FirebaseCloudDialog(tk.Toplevel):
         mode = self.scope_var.get()
         action = self.group_action_var.get()
         is_group = mode == "group"
+
+        # Erst alle Gruppen-Zusatzfelder ausblenden.
+        # Dadurch sieht der Dialog nicht mehr so voll aus.
+        self._group_action_frame.pack_forget()
+        self._join_mode_frame.pack_forget()
+        self._group_label.pack_forget()
+        self.e_group.pack_forget()
+        self._group_code_label.pack_forget()
+        self.e_group_code.pack_forget()
+
+        # Eingabefelder sicher deaktivieren, solange sie nicht sichtbar sind.
+        self.e_group.configure(state="disabled")
+        self.e_group_code.configure(state="disabled")
+
+        # Persönlicher Cloud-Bereich:
+        # Keine Gruppenfelder anzeigen.
+        if not is_group:
+            return
+
+        # Erst wenn "Gruppe" gewählt wurde, zeigen wir die Auswahl:
+        # beitreten oder erstellen.
         for child in self._group_action_frame.winfo_children():
-            child.configure(state="normal" if is_group else "disabled")
-        self.e_group.configure(state="normal" if is_group and action == "create" else "disabled")
-        self.e_group_code.configure(state="normal" if is_group and action == "join" else "disabled")
-        for child in self._join_mode_frame.winfo_children():
-            try:
-                child.configure(state="normal" if is_group and action == "create" else "disabled")
-            except Exception:
-                pass
+            child.configure(state="normal")
+        self._group_action_frame.pack(fill="x", pady=(8, 0))
+
+        if action == "create":
+            # Nur beim Erstellen: Gruppenname + Beitrittsart anzeigen.
+            self._group_label.configure(text="Gruppenname")
+            self._group_label.pack(anchor="w", pady=(8, 2))
+
+            self.e_group.configure(state="normal")
+            self.e_group.pack(fill="x", ipady=4)
+
+            for child in self._join_mode_frame.winfo_children():
+                try:
+                    child.configure(state="normal")
+                except Exception:
+                    pass
+            self._join_mode_frame.pack(fill="x", pady=(8, 0))
+
+        else:
+            # Nur beim Beitreten: Gruppencode anzeigen.
+            self._group_code_label.configure(text="Gruppencode")
+            self._group_code_label.pack(anchor="w", pady=(8, 2))
+
+            self.e_group_code.configure(state="normal")
+            self.e_group_code.pack(fill="x", ipady=4)
 
     def _set_status(self, msg: str):
         self.status.configure(text=msg)
