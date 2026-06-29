@@ -6,6 +6,7 @@ from .core import (
     BASE_DIR,
     _firebase_lookup,
     _firebase_send_verification,
+    _firebase_reset_password,
     _firebase_sign_in,
     _firebase_sign_up,
     _group_scope_from_auth,
@@ -175,6 +176,7 @@ class FirebaseLoginDialog(tk.Toplevel):
         tk.Button(btns, text="Anmelden", bg=ACCENT, fg="#fff", font=("Segoe UI", 10, "bold"), bd=0, padx=16, pady=8, cursor="hand2", command=self._login).pack(side="right", padx=(8, 0))
         tk.Button(btns, text="Konto anlegen", bg=ACCENT2, fg="#fff", font=("Segoe UI", 10, "bold"), bd=0, padx=16, pady=8, cursor="hand2", command=self._register_account).pack(side="right", padx=(8, 0))
         tk.Button(btns, text="Verifizierungs-Mail senden", bg=BORDER, fg=TEXT, font=("Segoe UI", 10), bd=0, padx=16, pady=8, cursor="hand2", command=self._resend_verification).pack(side="left")
+        tk.Button(btns, text="Passwort zurücksetzen", bg=BORDER, fg=WARNING, font=("Segoe UI", 10), bd=0, padx=16, pady=8, cursor="hand2", command=self._reset_password).pack(side="left", padx=(8, 0))
         tk.Button(btns, text="Abbrechen", bg=BORDER, fg=TEXT, font=("Segoe UI", 10), bd=0, padx=16, pady=8, cursor="hand2", command=self.destroy).pack(side="left", padx=(8, 0))
 
         self.bind("<Return>", lambda e: self._login())
@@ -260,6 +262,17 @@ class FirebaseLoginDialog(tk.Toplevel):
         except Exception as exc:
             self._set_status(f"Verifizierung konnte nicht gesendet werden: {exc}")
 
+    def _reset_password(self):
+        email = self.e_email.get().strip()
+        if not email:
+            self._set_status("Bitte zuerst die E-Mail-Adresse eingeben.")
+            return
+        try:
+            self._set_status("Sende Passwort-Reset-Mail ...")
+            _firebase_reset_password(email)
+            self._set_status("✓ Mail gesendet. Bitte Posteingang (und Spam) prüfen.")
+        except Exception as exc:
+            self._set_status(f"Fehler: {exc}")
 
 class FirebaseCloudDialog(tk.Toplevel):
     """Bereichsauswahl für einen bereits angemeldeten Firebase-User."""

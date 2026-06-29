@@ -622,6 +622,16 @@ def _firebase_sign_up(email: str, password: str) -> dict:
         },
     )
 
+def _firebase_reset_password(email: str) -> None:
+    """Schickt eine Passwort-Zurücksetzen-Mail über Firebase."""
+    _firebase_rest_post(
+        "accounts:sendOobCode",
+        {
+            "requestType": "PASSWORD_RESET",
+            "email": email,
+        },
+    )
+
 
 def _firebase_lookup(id_token: str) -> dict:
     return _firebase_rest_post(
