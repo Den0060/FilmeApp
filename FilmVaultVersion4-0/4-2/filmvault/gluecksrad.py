@@ -62,6 +62,17 @@ class GluecksradFrame(tk.Frame):
         self.inner.bind("<Configure>",
             lambda e: self.check_canvas.configure(
                 scrollregion=self.check_canvas.bbox("all")))
+        self.check_canvas.bind("<Configure>",
+            lambda e: self.check_canvas.itemconfigure(
+                self._inner_window, width=e.width))
+
+        # Mausrad zum Scrollen der Filmliste
+        self.check_canvas.bind("<MouseWheel>", self._mausrad) # Windows / macOS
+        self.check_canvas.bind("<Button-4>", self._mausrad) # Linux hoch
+        self.check_canvas.bind("<Button-5>", self._mausrad)# Linux runter
+        self.inner.bind("<MouseWheel>", self._mausrad)
+        self.inner.bind("<Button-4>", self._mausrad)
+        self.inner.bind("<Button-5>", self._mausrad)
 
         # Alle / Keine Buttons unten
         btns = tk.Frame(left, bg=PANEL, pady=8)
@@ -97,6 +108,15 @@ class GluecksradFrame(tk.Frame):
                                   command=self.starten)
         self.spin_btn.pack()
 
+    def _mausrad(self, event):
+        """Scrollt die Filmliste per Mausrad – Windows/macOS nutzen delta, Linux Button 4/5."""
+        if event.num == 4:
+            self.check_canvas.yview_scroll(-1, "units")
+        elif event.num == 5:
+            self.check_canvas.yview_scroll(1, "units")
+        else:
+            self.check_canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+
     def _kuerze_titel(self, titel, max_len=24):
         # nur um Titel beim Glücksrad zu kürzen
         if len(titel) <= max_len:
@@ -115,6 +135,9 @@ class GluecksradFrame(tk.Frame):
         for i, (fid, titel) in enumerate(self.filme):
             zeile = tk.Frame(self.inner, bg=PANEL)
             zeile.pack(fill="x", pady=2, padx=4)
+            zeile.bind("<MouseWheel>", self._mausrad)
+            zeile.bind("<Button-4>", self._mausrad)
+            zeile.bind("<Button-5>", self._mausrad)
 
             kurzer_titel = self._kuerze_titel(titel, max_len=32)
 
@@ -124,6 +147,9 @@ class GluecksradFrame(tk.Frame):
                                 font=("Segoe UI", 10), anchor="w", cursor="hand2",
                                 command=self._zeichne_rad_wenn_idle)
             cb.pack(side="left", fill="x", expand=True)
+            cb.bind("<MouseWheel>", self._mausrad)
+            cb.bind("<Button-4>", self._mausrad)
+            cb.bind("<Button-5>", self._mausrad)
 
             # Kein Redraw während die Animation läuft – tick() übernimmt das sowieso
             sp = tk.Spinbox(zeile, from_=1, to=5, width=2,
@@ -132,6 +158,9 @@ class GluecksradFrame(tk.Frame):
                             highlightthickness=0, bd=0, font=("Segoe UI", 9),
                             command=self._zeichne_rad_wenn_idle)
             sp.pack(side="right")
+            sp.bind("<MouseWheel>", self._mausrad)
+            sp.bind("<Button-4>", self._mausrad)
+            sp.bind("<Button-5>", self._mausrad)
 
         self._zeichne_rad()
 
