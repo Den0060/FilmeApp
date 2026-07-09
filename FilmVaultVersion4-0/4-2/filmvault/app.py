@@ -77,7 +77,7 @@ try:
 except Exception:
     Image = ImageTk = ImageOps = None
 
-APP_VERSION = "4.2"
+APP_VERSION = "4.2.1"
 
 def _sync_core_state():
     """Hält die dynamischen Core-Werte für dieses Modul aktuell."""
