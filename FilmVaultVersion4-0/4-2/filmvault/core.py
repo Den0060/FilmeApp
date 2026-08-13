@@ -124,42 +124,56 @@ def _internet_verfuegbar() -> bool:
         return False
 
 
-def imdb_suche(titel: str) -> list[dict]:
-    """
-    Sucht nach Filmen auf IMDb. Gibt eine Liste von Treffern zurück,
-    jeder als simples dict mit id, titel und jahr – mehr brauchen wir
-    für die Auswahlliste nicht.
-    """
+def imdb_suche(titel: str, max_ergebnisse: int = 50) -> list[dict]:
     if not IMDB_VERFUEGBAR:
         return []
     try:
         url = "https://www.omdbapi.com/"
-        params = {
-            "apikey": OMDB_API_KEY,
-            "s": titel,
-            "type": "movie",
-            "page": 1,
-            "r": "json",
-        }
-        response = requests.get(url, params=params, timeout=8)
-        response.raise_for_status()
-        data = response.json()
-
-        if data.get("Response") != "True":
-            return []
-
         ergebnis = []
-        for t in data.get("Search", [])[:10]:  # max 10 Treffer reichen
-            # Nur echte Filme wollen wir, keine Serien oder Spiele
-            if t.get("Type", "movie") not in ("movie", "short"):
-                continue
+        seite = 1
+        total = None
 
-            jahr = t.get("Year", "?")
-            ergebnis.append({
-                "id":    t.get("imdbID", ""),
-                "titel": t.get("Title", "?"),
-                "jahr":  jahr,
-            })
+        while len(ergebnis) < max_ergebnisse:
+            params = {
+                "apikey": OMDB_API_KEY,
+                "s": titel,
+                "type": "movie",
+                "page": seite,          # ← zählt jetzt hoch statt fix 1
+                "r": "json",
+            }
+            response = requests.get(url, params=params, timeout=8)
+            response.raise_for_status()
+            data = response.json()
+
+            if data.get("Response") != "True":
+                break
+
+            if total is None:
+                try:
+                    total = int(data.get("totalResults", 0))
+                except (TypeError, ValueError):
+                    total = 0
+
+            treffer = data.get("Search", [])
+            if not treffer:
+                break
+
+            for t in treffer:
+                if t.get("Type", "movie") not in ("movie", "short"):
+                    continue
+                jahr = t.get("Year", "?")
+                ergebnis.append({
+                    "id":    t.get("imdbID", ""),
+                    "titel": t.get("Title", "?"),
+                    "jahr":  jahr,
+                })
+                if len(ergebnis) >= max_ergebnisse:
+                    break
+
+            if len(ergebnis) >= total or len(treffer) < 10:
+                break
+            seite += 1
+
         return ergebnis
     except Exception:
         return []

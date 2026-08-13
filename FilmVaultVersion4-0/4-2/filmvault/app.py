@@ -1796,8 +1796,8 @@ class FilmApp(tk.Tk):
             if gesehen_am:
                 try:
                     jahr_datum = str(gesehen_am)[:10]  # z.B. 2026-05-30
-                    jahr, monat, tag = jahr_datum.split("-")
-                    status = f"✅ {tag}.{monat}.{jahr}" # für das Deutsche Format
+                    gj, monat, tag = jahr_datum.split("-")
+                    status = f"✅ {tag}.{monat}.{gj}" # für das Deutsche Format
                 except Exception:
                     status = f"✅ {gesehen_am}"
             else:
